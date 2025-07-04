@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <initializer_list>
+#include <memory>
 #include <string>
 #include <utility>
 
@@ -517,6 +518,50 @@ void Search::Worker::clear() {
     refreshTable.clear(networks[numaAccessToken]);
 }
 
+// AlphaZero-inspired move selection with MCTS-like exploration
+Move Search::Worker::select_move_alphazero(Position& pos, Stack* ss, Depth depth) {
+    // This is a simplified version of MCTS, focusing on move selection.
+    // It does not include the full tree search and backpropagation of AlphaZero.
+
+    Move best_move = Move::none();
+    float best_score = -1e9; // Initialize with a very low value
+
+    MoveList<LEGAL> moves(pos);
+
+    if (moves.size() == 0) return Move::none();
+
+    // Exploration parameter (adjust as needed)
+    float c_puct = 1.0;
+
+    // Total visit count (simplified, not a full MCTS tree)
+    int total_visits = 0;
+    for (const auto& move : moves) {
+        total_visits += move.score; // Use move.score as a proxy for visit count
+    }
+
+    // Iterate through all legal moves
+    for (const auto& move : moves) {
+        // Prior probability (from policy network - replace with actual NN output)
+        float prior_prob = 0.2; // Example value, replace with NN output
+
+        // Value estimate (from value network - replace with actual NN output)
+        float value_estimate = 0.0; // Example value, replace with NN output
+
+        // Visit count (simplified, using move.score as a proxy)
+        int visit_count = move.score;
+
+        // Calculate UCB score
+        float ucb_score = value_estimate + c_puct * prior_prob * std::sqrt(total_visits) / (1 + visit_count);
+
+        // Update best move if necessary
+        if (ucb_score > best_score) {
+            best_score = ucb_score;
+            best_move = move;
+        }
+    }
+
+    return best_move;
+}
 
 // Main search function for both PV and non-PV nodes
 template<NodeType nodeType>
@@ -692,27 +737,27 @@ Value Search::Worker::search(
         unadjustedStaticEval = eval = ss->staticEval;
     else if (ss->ttHit)
     {
-        // Never assume anything about values stored in TT
-        unadjustedStaticEval = ttData.eval;
-        if (!is_valid(unadjustedStaticEval))
+            // Never assume anything about values stored in TT
+            unadjustedStaticEval = ttData.eval;
+            if (!is_valid(unadjustedStaticEval))
+                unadjustedStaticEval = evaluate(pos);
+
+            ss->staticEval = eval = to_corrected_static_eval(unadjustedStaticEval, correctionValue);
+
+            // ttValue can be used as a better position evaluation
+            if (is_valid(ttData.value)
+                && (ttData.bound & (ttData.value > eval ? BOUND_LOWER : BOUND_UPPER)))
+                eval = ttData.value;
+        }
+        else
+        {
             unadjustedStaticEval = evaluate(pos);
+            ss->staticEval = eval = to_corrected_static_eval(unadjustedStaticEval, correctionValue);
 
-        ss->staticEval = eval = to_corrected_static_eval(unadjustedStaticEval, correctionValue);
-
-        // ttValue can be used as a better position evaluation
-        if (is_valid(ttData.value)
-            && (ttData.bound & (ttData.value > eval ? BOUND_LOWER : BOUND_UPPER)))
-            eval = ttData.value;
-    }
-    else
-    {
-        unadjustedStaticEval = evaluate(pos);
-        ss->staticEval = eval = to_corrected_static_eval(unadjustedStaticEval, correctionValue);
-
-        // Static evaluation is saved as it was before adjustment by correction history
-        ttWriter.write(posKey, VALUE_NONE, ss->ttPv, BOUND_NONE, DEPTH_UNSEARCHED, Move::none(),
+            // Static evaluation is saved as it was before adjustment by correction history
+            ttWriter.write(posKey, VALUE_NONE, ss->ttPv, BOUND_NONE, DEPTH_UNSEARCHED, Move::none(),
                        unadjustedStaticEval, tt.generation());
-    }
+        }
 
     // Use static evaluation difference to improve quiet move ordering
     if (((ss - 1)->currentMove).is_ok() && !(ss - 1)->inCheck && !priorCapture && !ttHit)
@@ -879,6 +924,7 @@ moves_loop:  // When in check, search starts here
       (ss - 4)->continuationHistory, (ss - 5)->continuationHistory, (ss - 6)->continuationHistory};
 
 
+    // Use AlphaZero-inspired move selection at the root node
     MovePicker mp(pos, ttData.move, depth, &thisThread->mainHistory, &thisThread->lowPlyHistory,
                   &thisThread->captureHistory, contHist, &thisThread->pawnHistory, ss->ply);
 
@@ -1921,3 +1967,4 @@ bool RootMove::extract_ponder_from_tt(const TranspositionTable& tt, Position& po
 
 
 }  // namespace Stockfish
+
