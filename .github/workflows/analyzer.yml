@@ -3,7 +3,7 @@ name: "Analyzer"
 on:
   schedule:
     - cron: '17 18 * * 1'
-
+  workflow_dispatch:
 jobs:
   CodeQL:
     name: Check security
