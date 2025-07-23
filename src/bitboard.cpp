@@ -57,7 +57,6 @@ constexpr Direction KnightDirections[] = {2 * SOUTH + WEST, 2 * SOUTH + EAST, SO
 constexpr Direction BishopDirections[] = {2 * NORTH_EAST, 2 * SOUTH_EAST, 2 * SOUTH_WEST,
                                         2 * NORTH_WEST};
 
-
 template<PieceType pt>
 void init_magics(Bitboard table[], Magic magics[] IF_NOT_PEXT(, const Bitboard magicsInit[]));
 
@@ -151,7 +150,7 @@ namespace {
 
 template<PieceType pt>
 Bitboard sliding_attack(Square sq, Bitboard occupied) {
-    static_assert(pt == ROOK || pt == CANNON, "Invalid piece type");
+    static_assert(pt == ROOK || pt == CANNON, "Invalid piece type for sliding attack");
     Bitboard attack = 0;
 
     for (Direction d : {NORTH, SOUTH, EAST, WEST})
@@ -193,15 +192,15 @@ Bitboard lame_leaper_path(Direction d, Square s) {
 
     int diff = std::abs(file_of(to) - file_of(s)) - std::abs(rank_of(to) - rank_of(s));
     s += diff > 0 ? df : (diff < 0 ? dr : df + dr);
-    return s;
+    return square_bb(s);
 }
 
 template<PieceType pt>
 Bitboard lame_leaper_path(Square s) {
     Bitboard b = 0;
     const auto& directions = pt == BISHOP ? BishopDirections : KnightDirections;
-    for (Direction d : directions)
-        b |= lame_leaper_path<pt>(d, s);
+    for (size_t i = 0; i < (pt == BISHOP ? 4 : 8); ++i)
+        b |= lame_leaper_path<pt>(directions[i], s);
     if (pt == BISHOP)
         b &= HalfBB[rank_of(s) > RANK_4];
     return b;
@@ -212,11 +211,12 @@ Bitboard lame_leaper_attack(Square s, Bitboard occupied) {
     Bitboard b = 0;
     const auto& directions = pt == BISHOP ? BishopDirections : KnightDirections;
     
-    for (Direction d : directions)
+    for (size_t i = 0; i < (pt == BISHOP ? 4 : 8); ++i)
     {
+        Direction d = directions[i];
         Square to = s + d;
         if (is_ok(to) && distance(s, to) < 4 && !(lame_leaper_path<pt>(d, s) & occupied))
-            b |= to;
+            b |= square_bb(to);
     }
     if (pt == BISHOP)
         b &= HalfBB[rank_of(s) > RANK_4];
@@ -225,12 +225,13 @@ Bitboard lame_leaper_attack(Square s, Bitboard occupied) {
 
 template<PieceType pt>
 void init_magics(Bitboard table[], Magic magics[] IF_NOT_PEXT(, const Bitboard magicsInit[])) {
+    size_t size = 0;
     for (Square s = SQ_A0; s <= SQ_I9; ++s)
     {
         Bitboard edges = ((Rank0BB | Rank9BB) & ~rank_bb(s)) | ((FileABB | FileIBB) & ~file_bb(s));
         Magic& m = magics[s];
         
-        m.mask = pt == ROOK ? sliding_attack<pt>(s, 0) :
+        m.mask = pt == ROOK ? sliding_attack<ROOK>(s, 0) :
                  pt == CANNON ? RookMagics[s].mask : lame_leaper_path<pt>(s);
         if (pt != KNIGHT_TO)
             m.mask &= ~edges;
@@ -245,15 +246,17 @@ void init_magics(Bitboard table[], Magic magics[] IF_NOT_PEXT(, const Bitboard m
         m.attacks = s == SQ_A0 ? table : magics[s - 1].attacks + size;
 
         Bitboard b = 0;
-        size_t size = 0;
+        size = 0;
         do {
-            m.attacks[m.index(b)] = pt == ROOK || pt == CANNON ? 
-                                   sliding_attack<pt>(s, b) : lame_leaper_attack<pt>(s, b);
+            m.attacks[m.index(b)] = pt == ROOK ? sliding_attack<ROOK>(s, b) :
+                                   pt == CANNON ? sliding_attack<CANNON>(s, b) : 
+                                   lame_leaper_attack<pt>(s, b);
             size++;
             b = (b - m.mask) & m.mask;
         } while (b);
     }
 }
+
 }
 
 }  // namespace Stockfish
