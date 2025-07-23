@@ -1,19 +1,19 @@
 /*
-  Stockfish, a UCI chess playing engine derived from Glaurung 2.1
-  Copyright (C) 2004-2025 The Stockfish developers (see AUTHORS file)
+  Stockfish, a UCI chess playing engine derived from Glaurung 2.1
+  Copyright (C) 2004-2025 The Stockfish developers (see AUTHORS file)
 
-  Stockfish is free software: you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 3 of the License, or
-  (at your option) any later version.
+  Stockfish is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
 
-  Stockfish is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
+  Stockfish is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
 
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  You should have received a copy of the GNU General Public License
+  along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 #include "bitboard.h"
@@ -25,7 +25,7 @@
 #include <set>
 #include <utility>
 #ifndef USE_PEXT
-    #include "magics.h"
+    #include "magics.h"
 #endif
 
 namespace Stockfish {
@@ -46,17 +46,24 @@ Magic KnightToMagics[SQUARE_NB];
 
 namespace {
 
-Bitboard RookTable[0x108000];    // To store rook attacks
-Bitboard CannonTable[0x108000];  // To store cannon attacks
-Bitboard BishopTable[0x228];     // To store bishop attacks
-Bitboard KnightTable[0x380];     // To store knight attacks
-Bitboard KnightToTable[0x3E0];   // To store by knight attacks
+Bitboard RookTable[0x108000];    // To store rook attacks
+Bitboard CannonTable[0x108000];  // To store cannon attacks
+Bitboard BishopTable[0x228];     // To store bishop attacks
+Bitboard KnightTable[0x380];     // To store knight attacks
+Bitboard KnightToTable[0x3E0];   // To store by knight attacks
 
-const std::set<Direction> KnightDirections{2 * SOUTH + WEST, 2 * SOUTH + EAST, SOUTH + 2 * WEST,
-                                           SOUTH + 2 * EAST, NORTH + 2 * WEST, NORTH + 2 * EAST,
-                                           2 * NORTH + WEST, 2 * NORTH + EAST};
-const std::set<Direction> BishopDirections{2 * NORTH_EAST, 2 * SOUTH_EAST, 2 * SOUTH_WEST,
-                                           2 * NORTH_WEST};
+// Using static const arrays instead of std::set for performance
+const Direction KnightDirections[] = {
+    2 * SOUTH + WEST, 2 * SOUTH + EAST, SOUTH + 2 * WEST,
+    SOUTH + 2 * EAST, NORTH + 2 * WEST, NORTH + 2 * EAST,
+    2 * NORTH + WEST, 2 * NORTH + EAST
+};
+const int NumKnightDirections = sizeof(KnightDirections) / sizeof(KnightDirections[0]);
+
+const Direction BishopDirections[] = {
+    2 * NORTH_EAST, 2 * SOUTH_EAST, 2 * SOUTH_WEST, 2 * NORTH_WEST
+};
+const int NumBishopDirections = sizeof(BishopDirections) / sizeof(BishopDirections[0]);
 
 
 template<PieceType pt>
@@ -68,28 +75,28 @@ Bitboard lame_leaper_path(Direction d, Square s);
 // Returns the bitboard of target square for the given step
 // from the given square. If the step is off the board, returns empty bitboard.
 Bitboard safe_destination(Square s, int step) {
-    Square to = Square(s + step);
-    return is_ok(to) && distance(s, to) <= 2 ? square_bb(to) : Bitboard(0);
+    Square to = Square(s + step);
+    return is_ok(to) && distance(s, to) <= 2 ? square_bb(to) : Bitboard(0);
 }
 
-}
+} // anonymous namespace
 
 // Returns an ASCII representation of a bitboard suitable
 // to be printed to standard output. Useful for debugging.
 std::string Bitboards::pretty(Bitboard b) {
 
-    std::string s = "+---+---+---+---+---+---+---+---+---+\n";
+    std::string s = "+---+---+---+---+---+---+---+---+---+\n";
 
-    for (Rank r = RANK_9; r >= RANK_0; --r)
-    {
-        for (File f = FILE_A; f <= FILE_I; ++f)
-            s += b & make_square(f, r) ? "| X " : "|   ";
+    for (Rank r = RANK_9; r >= RANK_0; --r)
+    {
+        for (File f = FILE_A; f <= FILE_I; ++f)
+            s += b & make_square(f, r) ? "| X " : "|   ";
 
-        s += "| " + std::to_string(r) + "\n+---+---+---+---+---+---+---+---+---+\n";
-    }
-    s += "  a   b   c   d   e   f   g   h   i\n";
+        s += "| " + std::to_string(r) + "\n+---+---+---+---+---+---+---+---+---+\n";
+    }
+    s += "  a   b   c   d   e   f   g   h   i\n";
 
-    return s;
+    return s;
 }
 
 
@@ -97,141 +104,176 @@ std::string Bitboards::pretty(Bitboard b) {
 // startup and relies on global objects to be already zero-initialized.
 void Bitboards::init() {
 
-    for (unsigned i = 0; i < (1 << 16); ++i)
-        PopCnt16[i] = uint8_t(std::bitset<16>(i).count());
+    for (unsigned i = 0; i < (1 << 16); ++i)
+        PopCnt16[i] = uint8_t(std::bitset<16>(i).count());
 
-    for (Square s = SQ_A0; s <= SQ_I9; ++s)
-        SquareBB[s] = (Bitboard(1ULL) << std::uint8_t(s));
+    for (Square s = SQ_A0; s <= SQ_I9; ++s)
+        SquareBB[s] = (Bitboard(1ULL) << std::uint8_t(s));
 
-    for (Square s1 = SQ_A0; s1 <= SQ_I9; ++s1)
-        for (Square s2 = SQ_A0; s2 <= SQ_I9; ++s2)
-            SquareDistance[s1][s2] = std::max(distance<File>(s1, s2), distance<Rank>(s1, s2));
+    for (Square s1 = SQ_A0; s1 <= SQ_I9; ++s1)
+        for (Square s2 = SQ_A0; s2 <= SQ_I9; ++s2)
+            SquareDistance[s1][s2] = std::max(distance<File>(s1, s2), distance<Rank>(s1, s2));
 
-    init_magics<ROOK>(RookTable, RookMagics IF_NOT_PEXT(, RookMagicsInit));
-    init_magics<CANNON>(CannonTable, CannonMagics IF_NOT_PEXT(, RookMagicsInit));
-    init_magics<BISHOP>(BishopTable, BishopMagics IF_NOT_PEXT(, BishopMagicsInit));
-    init_magics<KNIGHT>(KnightTable, KnightMagics IF_NOT_PEXT(, KnightMagicsInit));
-    init_magics<KNIGHT_TO>(KnightToTable, KnightToMagics IF_NOT_PEXT(, KnightToMagicsInit));
+    init_magics<ROOK>(RookTable, RookMagics IF_NOT_PEXT(, RookMagicsInit));
+    // For CANNON, reuse Rook's masks since their sliding behavior for masks is the same
+    init_magics<CANNON>(CannonTable, CannonMagics IF_NOT_PEXT(, RookMagicsInit));
+    init_magics<BISHOP>(BishopTable, BishopMagics IF_NOT_PEXT(, BishopMagicsInit));
+    init_magics<KNIGHT>(KnightTable, KnightMagics IF_NOT_PEXT(, KnightMagicsInit));
+    init_magics<KNIGHT_TO>(KnightToTable, KnightToMagics IF_NOT_PEXT(, KnightToMagicsInit));
 
-    for (Square s1 = SQ_A0; s1 <= SQ_I9; ++s1)
-    {
-        PseudoAttacks[NO_PIECE_TYPE][s1] = pawn_attacks_bb<WHITE>(s1);
-        PseudoAttacks[PAWN][s1]          = pawn_attacks_bb<BLACK>(s1);
+    for (Square s1 = SQ_A0; s1 <= SQ_I9; ++s1)
+    {
+        PseudoAttacks[NO_PIECE_TYPE][s1] = pawn_attacks_bb<WHITE>(s1);
+        PseudoAttacks[PAWN][s1]          = pawn_attacks_bb<BLACK>(s1);
 
-        PseudoAttacks[KNIGHT_TO][s1] = pawn_attacks_to_bb<WHITE>(s1);
-        PseudoAttacks[PAWN_TO][s1]   = pawn_attacks_to_bb<BLACK>(s1);
+        PseudoAttacks[KNIGHT_TO][s1] = pawn_attacks_to_bb<WHITE>(s1);
+        PseudoAttacks[PAWN_TO][s1]   = pawn_attacks_to_bb<BLACK>(s1);
 
-        PseudoAttacks[ROOK][s1]   = attacks_bb<ROOK>(s1, 0);
-        PseudoAttacks[BISHOP][s1] = attacks_bb<BISHOP>(s1, 0);
-        PseudoAttacks[KNIGHT][s1] = attacks_bb<KNIGHT>(s1, 0);
+        PseudoAttacks[ROOK][s1]   = attacks_bb<ROOK>(s1, 0);
+        PseudoAttacks[BISHOP][s1] = attacks_bb<BISHOP>(s1, 0);
+        PseudoAttacks[KNIGHT][s1] = attacks_bb<KNIGHT>(s1, 0);
 
-        // Only generate pseudo attacks in the palace squares for king and advisor
-        if (Palace & s1)
-        {
-            for (int step : {NORTH, SOUTH, WEST, EAST})
-                PseudoAttacks[KING][s1] |= safe_destination(s1, step);
-            PseudoAttacks[KING][s1] &= Palace;
+        // Only generate pseudo attacks in the palace squares for king and advisor
+        if (Palace & s1)
+        {
+            for (int step : {NORTH, SOUTH, WEST, EAST})
+                PseudoAttacks[KING][s1] |= safe_destination(s1, step);
+            PseudoAttacks[KING][s1] &= Palace;
 
-            for (int step : {NORTH_WEST, NORTH_EAST, SOUTH_WEST, SOUTH_EAST})
-                PseudoAttacks[ADVISOR][s1] |= safe_destination(s1, step);
-            PseudoAttacks[ADVISOR][s1] &= Palace;
-        }
+            for (int step : {NORTH_WEST, NORTH_EAST, SOUTH_WEST, SOUTH_EAST})
+                PseudoAttacks[ADVISOR][s1] |= safe_destination(s1, step);
+            PseudoAttacks[ADVISOR][s1] &= Palace;
+        }
 
-        for (Square s2 = SQ_A0; s2 <= SQ_I9; ++s2)
-        {
-            if (PseudoAttacks[ROOK][s1] & s2)
-            {
-                LineBB[s1][s2] = (attacks_bb(ROOK, s1, 0) & attacks_bb(ROOK, s2, 0)) | s1 | s2;
-                BetweenBB[s1][s2] =
-                  (attacks_bb(ROOK, s1, square_bb(s2)) & attacks_bb(ROOK, s2, square_bb(s1)));
+        for (Square s2 = SQ_A0; s2 <= SQ_I9; ++s2)
+        {
+            if (PseudoAttacks[ROOK][s1] & s2)
+            {
+                LineBB[s1][s2] = (attacks_bb(ROOK, s1, 0) & attacks_bb(ROOK, s2, 0)) | s1 | s2;
+                BetweenBB[s1][s2] =
+                  (attacks_bb(ROOK, s1, square_bb(s2)) & attacks_bb(ROOK, s2, square_bb(s1)));
+            }
+            // Optimized BetweenBB for KNIGHT using direct calculation if possible
+            if (PseudoAttacks[KNIGHT][s1] & s2) {
+                // Knight path is always a single square
+                Direction d = Direction(s2 - s1);
+                Square via = s1;
+
+                Direction dr = d > 0 ? NORTH : SOUTH;
+                Direction df = (std::abs(d % NORTH) < NORTH / 2 ? d % NORTH : -(d % NORTH)) < 0 ? WEST : EAST;
+
+                int diff = std::abs(file_of(s2) - file_of(s1)) - std::abs(rank_of(s2) - rank_of(s1));
+                if (diff > 0)
+                    via += df;
+                else if (diff < 0)
+                    via += dr;
+                else
+                    via += df + dr;
+
+                BetweenBB[s1][s2] |= square_bb(via);
             }
-
-            if (PseudoAttacks[KNIGHT][s1] & s2)
-                BetweenBB[s1][s2] |= lame_leaper_path<KNIGHT_TO>(Direction(s2 - s1), s1);
-
-            BetweenBB[s1][s2] |= s2;
-        }
-    }
+            BetweenBB[s1][s2] |= s2;
+        }
+    }
 }
 
 namespace {
 
 template<PieceType pt>
 Bitboard sliding_attack(Square sq, Bitboard occupied) {
-    assert(pt == ROOK || pt == CANNON);
-    Bitboard attack = 0;
+    assert(pt == ROOK || pt == CANNON);
+    Bitboard attack = 0;
 
-    for (auto const& d : {NORTH, SOUTH, EAST, WEST})
-    {
-        bool hurdle = false;
-        for (Square s = sq + d; is_ok(s) && distance(s - d, s) == 1; s += d)
-        {
-            if (pt == ROOK || hurdle)
-                attack |= s;
+    for (auto const& d : {NORTH, SOUTH, EAST, WEST})
+    {
+        bool hurdle = false;
+        for (Square s = sq + d; is_ok(s) && distance(s - d, s) == 1; s += d)
+        {
+            if (pt == ROOK || hurdle)
+                attack |= s;
 
-            if (occupied & s)
-            {
-                if (pt == CANNON && !hurdle)
-                    hurdle = true;
-                else
-                    break;
-            }
-        }
-    }
+            if (occupied & s)
+            {
+                if (pt == CANNON && !hurdle)
+                    hurdle = true;
+                else
+                    break;
+            }
+        }
+    }
 
-    return attack;
+    return attack;
 }
 
+// Unified lame_leaper_path for all relevant piece types
 template<PieceType pt>
 Bitboard lame_leaper_path(Direction d, Square s) {
-    Bitboard b  = 0;
-    Square   to = s + d;
-    if (!is_ok(to) || distance(s, to) >= 4)
+    Bitboard b = 0;
+    Square to = s + d;
+    if (!is_ok(to) || distance(s, to) >= 4) // distance check is crucial
         return b;
 
     // If piece type is by knight attacks, swap the source and destination square
-    if (pt == KNIGHT_TO)
-    {
+    if (pt == KNIGHT_TO) {
         std::swap(s, to);
         d = -d;
     }
 
+    // Calculate the intermediate square directly
+    // This logic is specific to Knight and Bishop paths as defined in the original code
+    // and determines the "hurdle" square.
     Direction dr = d > 0 ? NORTH : SOUTH;
     Direction df = (std::abs(d % NORTH) < NORTH / 2 ? d % NORTH : -(d % NORTH)) < 0 ? WEST : EAST;
 
-    int diff = std::abs(file_of(to) - file_of(s)) - std::abs(rank_of(to) - rank_of(s));
-    if (diff > 0)
-        s += df;
-    else if (diff < 0)
-        s += dr;
-    else
-        s += df + dr;
+    Square intermediate_sq = s;
+    int diff_file_abs = std::abs(file_of(to) - file_of(s));
+    int diff_rank_abs = std::abs(rank_of(to) - rank_of(s));
 
-    b |= s;
+    if (diff_file_abs > diff_rank_abs)
+        intermediate_sq += df;
+    else if (diff_file_abs < diff_rank_abs)
+        intermediate_sq += dr;
+    else // Diagonal move where both file and rank change by same amount
+        intermediate_sq += df + dr;
+
+    b |= square_bb(intermediate_sq);
     return b;
 }
 
+// Optimized lame_leaper_path without direction 'd'
 template<PieceType pt>
 Bitboard lame_leaper_path(Square s) {
     Bitboard b = 0;
-    for (const auto& d : pt == BISHOP ? BishopDirections : KnightDirections)
-        b |= lame_leaper_path<pt>(d, s);
-    if (pt == BISHOP)
+    if (pt == BISHOP) {
+        for (int i = 0; i < NumBishopDirections; ++i)
+            b |= lame_leaper_path<pt>(BishopDirections[i], s);
         b &= HalfBB[rank_of(s) > RANK_4];
+    } else { // KNIGHT or KNIGHT_TO
+        for (int i = 0; i < NumKnightDirections; ++i)
+            b |= lame_leaper_path<pt>(KnightDirections[i], s);
+    }
     return b;
 }
 
 template<PieceType pt>
 Bitboard lame_leaper_attack(Square s, Bitboard occupied) {
     Bitboard b = 0;
-    for (const auto& d : pt == BISHOP ? BishopDirections : KnightDirections)
-    {
-        Square to = s + d;
-        if (is_ok(to) && distance(s, to) < 4 && !(lame_leaper_path<pt>(d, s) & occupied))
-            b |= to;
-    }
-    if (pt == BISHOP)
+    if (pt == BISHOP) {
+        for (int i = 0; i < NumBishopDirections; ++i) {
+            Direction d = BishopDirections[i];
+            Square to = s + d;
+            if (is_ok(to) && distance(s, to) < 4 && !(lame_leaper_path<pt>(d, s) & occupied))
+                b |= to;
+        }
         b &= HalfBB[rank_of(s) > RANK_4];
+    } else { // KNIGHT or KNIGHT_TO
+        for (int i = 0; i < NumKnightDirections; ++i) {
+            Direction d = KnightDirections[i];
+            Square to = s + d;
+            if (is_ok(to) && distance(s, to) < 4 && !(lame_leaper_path<pt>(d, s) & occupied))
+                b |= to;
+        }
+    }
     return b;
 }
 
@@ -243,49 +285,60 @@ Bitboard lame_leaper_attack(Square s, Bitboard occupied) {
 template<PieceType pt>
 void init_magics(Bitboard table[], Magic magics[] IF_NOT_PEXT(, const Bitboard magicsInit[])) {
 
-    Bitboard edges, b;
-    uint64_t size = 0;
+    Bitboard edges, b;
+    uint64_t size = 0;
 
-    for (Square s = SQ_A0; s <= SQ_I9; ++s)
-    {
-        // Board edges are not considered in the relevant occupancies
-        edges = ((Rank0BB | Rank9BB) & ~rank_bb(s)) | ((FileABB | FileIBB) & ~file_bb(s));
+    for (Square s = SQ_A0; s <= SQ_I9; ++s)
+    {
+        // Board edges are not considered in the relevant occupancies
+        edges = ((Rank0BB | Rank9BB) & ~rank_bb(s)) | ((FileABB | FileIBB) & ~file_bb(s));
 
-        // Given a square 's', the mask is the bitboard of sliding attacks from
-        // 's' computed on an empty board. The index must be big enough to contain
-        // all the attacks for each possible subset of the mask and so is 2 power
-        // the number of 1s of the mask.
-        Magic& m = magics[s];
-        m.mask   = pt == ROOK   ? sliding_attack<pt>(s, 0)
-                 : pt == CANNON ? RookMagics[s].mask
-                                : lame_leaper_path<pt>(s);
+        // Given a square 's', the mask is the bitboard of sliding attacks from
+        // 's' computed on an empty board. The index must be big enough to contain
+        // all the attacks for each possible subset of the mask and so is 2 power
+        // the number of 1s of the mask.
+        Magic& m = magics[s];
+
+        if (pt == ROOK)
+            m.mask = sliding_attack<ROOK>(s, 0);
+        else if (pt == CANNON)
+            // Cannon mask is identical to Rook mask (all squares reachable)
+            // However, the attacks themselves differ (hurdle).
+            m.mask = RookMagics[s].mask;
+        else if (pt == BISHOP || pt == KNIGHT || pt == KNIGHT_TO)
+            m.mask = lame_leaper_path<pt>(s);
+        else
+            m.mask = 0; // Should not happen for initialized types
+
+        // KNIGHT_TO mask can include edges, as it represents squares that attack 's'
+        // which might be on the edge, while 's' might be internal.
         if (pt != KNIGHT_TO)
             m.mask &= ~edges;
 
 #ifdef USE_PEXT
-        m.shift = popcount(uint64_t(m.mask));
+        m.shift = popcount(uint64_t(m.mask));
 #else
-        m.magic = magicsInit[s];
-        m.shift = 128 - popcount(m.mask);
+        m.magic = magicsInit[s];
+        m.shift = 128 - popcount(m.mask);
 #endif
 
-        // Set the offset for the attacks table of the square. We have individual
-        // table sizes for each square with "Fancy Magic Bitboards".
-        m.attacks = s == SQ_A0 ? table : magics[s - 1].attacks + size;
+        // Set the offset for the attacks table of the square. We have individual
+        // table sizes for each square with "Fancy Magic Bitboards".
+        m.attacks = s == SQ_A0 ? table : magics[s - 1].attacks + size;
 
-        // Use Carry-Rippler trick to enumerate all subsets of masks[s] and
-        // store the corresponding attack bitboard in m.attacks.
-        b = size = 0;
-        do
-        {
-            m.attacks[m.index(b)] =
-              pt == ROOK || pt == CANNON ? sliding_attack<pt>(s, b) : lame_leaper_attack<pt>(s, b);
+        // Use Carry-Rippler trick to enumerate all subsets of masks[s] and
+        // store the corresponding attack bitboard in m.attacks.
+        b = size = 0;
+        do
+        {
+            m.attacks[m.index(b)] =
+              pt == ROOK || pt == CANNON ? sliding_attack<pt>(s, b) : lame_leaper_attack<pt>(s, b);
 
-            size++;
-            b = (b - m.mask) & m.mask;
-        } while (b);
-    }
+            size++;
+            b = (b - m.mask) & m.mask;
+        } while (b);
+    }
 }
-}
+} // anonymous namespace
 
-}  // namespace Stockfish
+}  // namespace Stockfish
