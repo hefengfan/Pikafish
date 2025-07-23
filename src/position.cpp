@@ -52,66 +52,108 @@ constexpr std::string_view PieceToChar(" RACPNBK racpnbk");
 static constexpr Piece Pieces[] = {W_ROOK, W_ADVISOR, W_CANNON, W_PAWN, W_KNIGHT, W_BISHOP, W_KING,
                                    B_ROOK, B_ADVISOR, B_CANNON, B_PAWN, B_KNIGHT, B_BISHOP, B_KING};
 
-// Precomputed attack tables for faster attack generation
-Bitboard RookAttacks[SQUARE_NB][512];  // 2^9 = 512 possible occupancies
-Bitboard KnightAttacks[SQUARE_NB];
+// Precomputed attack tables
+Bitboard RookAttacks[SQUARE_NB][512];
 Bitboard CannonAttacks[SQUARE_NB][512];
 Bitboard BishopAttacks[SQUARE_NB][512];
+Bitboard KnightAttacks[SQUARE_NB];
 Bitboard AdvisorAttacks[SQUARE_NB];
 Bitboard KingAttacks[SQUARE_NB];
 Bitboard WhitePawnAttacks[SQUARE_NB];
 Bitboard BlackPawnAttacks[SQUARE_NB];
 
 
-// Initialize precomputed attack tables
+// Helper function to get rook attacks using magic bitboards
+Bitboard get_rook_attacks(Square s, Bitboard occupied) {
+    occupied &= RookMasks[s];
+    occupied *= MagicRookNumbers[s];
+    occupied >>= (64 - RookRelevantBits[s]);
+    return RookAttacks[s][occupied];
+}
+
+// Helper function to get cannon attacks using magic bitboards
+Bitboard get_cannon_attacks(Square s, Bitboard occupied) {
+    occupied &= RookMasks[s];
+    occupied *= MagicRookNumbers[s];
+    occupied >>= (64 - RookRelevantBits[s]);
+    return CannonAttacks[s][occupied];
+}
+
+// Helper function to get bishop attacks using magic bitboards
+Bitboard get_bishop_attacks(Square s, Bitboard occupied) {
+    occupied &= BishopMasks[s];
+    occupied *= MagicBishopNumbers[s];
+    occupied >>= (64 - BishopRelevantBits[s]);
+    return BishopAttacks[s][occupied];
+}
+
+
+// Initialize attack tables
 void init_attack_tables() {
     for (Square s = SQ_A0; s <= SQ_I9; ++s) {
-        KnightAttacks[s] = attacks_bb<KNIGHT>(s, 0);
-        AdvisorAttacks[s] = attacks_bb<ADVISOR>(s, 0);
-        KingAttacks[s] = attacks_bb<KING>(s, 0);
+        // Rook and Cannon attacks
+        for (int i = 0; i < 512; ++i) {
+            Bitboard occupied = 0;
+            int relevantBits = RookRelevantBits[s];
+            for (int j = 0; j < relevantBits; ++j) {
+                if (i & (1 << j)) {
+                    Square sq = s;
+                    int bitIndex = 0;
+                    for (int k = 0; k < 4; ++k) {
+                        for (int l = 0; Directions[ROOK][k][l] != 0; ++l) {
+                            sq = Square(int(sq) + Directions[ROOK][k][l]);
+                            if (sq == SQ_NONE) break;
+                            if (RookMasks[s] & sq) {
+                                if (bitIndex == j) {
+                                    occupied |= sq;
+                                    break;
+                                }
+                                bitIndex++;
+                            }
+                        }
+                    }
+                }
+            }
+
+            RookAttacks[s][(occupied * MagicRookNumbers[s]) >> (64 - relevantBits)] = attacks_bb<ROOK>(s, occupied);
+            CannonAttacks[s][(occupied * MagicRookNumbers[s]) >> (64 - relevantBits)] = attacks_bb<CANNON>(s, occupied);
+        }
+
+        // Bishop attacks
+        for (int i = 0; i < 512; ++i) {
+            Bitboard occupied = 0;
+            int relevantBits = BishopRelevantBits[s];
+            for (int j = 0; j < relevantBits; ++j) {
+                if (i & (1 << j)) {
+                    Square sq = s;
+                    int bitIndex = 0;
+                    for (int k = 0; k < 4; ++k) {
+                        for (int l = 0; Directions[BISHOP][k][l] != 0; ++l) {
+                            sq = Square(int(sq) + Directions[BISHOP][k][l]);
+                            if (sq == SQ_NONE) break;
+                            if (BishopMasks[s] & sq) {
+                                if (bitIndex == j) {
+                                    occupied |= sq;
+                                    break;
+                                }
+                                bitIndex++;
+                            }
+                        }
+                    }
+                }
+            }
+            BishopAttacks[s][(occupied * MagicBishopNumbers[s]) >> (64 - relevantBits)] = attacks_bb<BISHOP>(s, occupied);
+        }
+
+        // Knight, Advisor, King, Pawn attacks
+        KnightAttacks[s] = attacks_bb<KNIGHT>(s);
+        AdvisorAttacks[s] = attacks_bb<ADVISOR>(s);
+        KingAttacks[s] = attacks_bb<KING>(s);
         WhitePawnAttacks[s] = attacks_bb<PAWN_TO>(s, WHITE);
         BlackPawnAttacks[s] = attacks_bb<PAWN_TO>(s, BLACK);
-
-        // Generate Rook attacks
-        for (int i = 0; i < 512; ++i) {
-            Bitboard occupancy = 0;
-            int bit_index = 0;
-            for (int j = 0; j < 9; ++j) { // 9 possible blocking squares
-                if ((i >> j) & 1) {
-                    Square block_sq = s + Directions[ROOK][j]; // Directions defined elsewhere
-                    occupancy |= square_bb(block_sq);
-                }
-            }
-            RookAttacks[s][i] = attacks_bb<ROOK>(s, occupancy);
-        }
-
-        // Generate Cannon attacks
-        for (int i = 0; i < 512; ++i) {
-            Bitboard occupancy = 0;
-            int bit_index = 0;
-            for (int j = 0; j < 9; ++j) { // 9 possible blocking squares
-                if ((i >> j) & 1) {
-                    Square block_sq = s + Directions[ROOK][j]; // Directions defined elsewhere
-                    occupancy |= square_bb(block_sq);
-                }
-            }
-            CannonAttacks[s][i] = attacks_bb<CANNON>(s, occupancy);
-        }
-
-        // Generate Bishop attacks
-        for (int i = 0; i < 512; ++i) {
-            Bitboard occupancy = 0;
-            int bit_index = 0;
-            for (int j = 0; j < 9; ++j) { // 9 possible blocking squares
-                if ((i >> j) & 1) {
-                    Square block_sq = s + Directions[BISHOP][j]; // Directions defined elsewhere
-                    occupancy |= square_bb(block_sq);
-                }
-            }
-            BishopAttacks[s][i] = attacks_bb<BISHOP>(s, occupancy);
-        }
     }
 }
+
 
 }  // namespace
 
@@ -151,7 +193,7 @@ void Position::init() {
     Zobrist::side    = rng.rand<Key>();
     Zobrist::noPawns = rng.rand<Key>();
 
-    init_attack_tables();
+    init_attack_tables(); // Initialize precomputed attack tables
 }
 
 
@@ -395,38 +437,15 @@ Bitboard Position::attackers_to(Square s, Bitboard occupied) const {
 }
 
 
-// Optimized attack generation functions using precomputed tables
-Bitboard Position::get_rook_attacks(Square s, Bitboard occupied) const {
-    // Calculate the index into the precomputed table based on the occupancy
-    Bitboard relevant_occupancy = occupied & RookMasks[s]; //RookMasks defined elsewhere
-    int index = (int)((relevant_occupancy * MagicRookNumbers[s]) >> (64 - RookRelevantBits[s])); //MagicRookNumbers and RookRelevantBits defined elsewhere
-    return RookAttacks[s][index];
-}
-
-Bitboard Position::get_cannon_attacks(Square s, Bitboard occupied) const {
-    // Calculate the index into the precomputed table based on the occupancy
-    Bitboard relevant_occupancy = occupied & RookMasks[s]; //RookMasks defined elsewhere
-    int index = (int)((relevant_occupancy * MagicRookNumbers[s]) >> (64 - RookRelevantBits[s])); //MagicRookNumbers and RookRelevantBits defined elsewhere
-    return CannonAttacks[s][index];
-}
-
-Bitboard Position::get_bishop_attacks(Square s, Bitboard occupied) const {
-    // Calculate the index into the precomputed table based on the occupancy
-    Bitboard relevant_occupancy = occupied & BishopMasks[s]; //BishopMasks defined elsewhere
-    int index = (int)((relevant_occupancy * MagicBishopNumbers[s]) >> (64 - BishopRelevantBits[s])); //MagicBishopNumbers and BishopRelevantBits defined elsewhere
-    return BishopAttacks[s][index];
-}
-
-
 // Computes a bitboard of all pieces of a given color
 // which gives check to a given square. Slider attacks use the occupied bitboard
 // to indicate occupancy.
 Bitboard Position::checkers_to(Color c, Square s, Bitboard occupied) const {
 
     return ((attacks_bb<PAWN_TO>(s, c) & pieces(PAWN))
-            | (KnightAttacks[s] & pieces(KNIGHT))
-            | (get_rook_attacks(s, occupied) & pieces(KING, ROOK))
-            | (get_cannon_attacks(s, occupied) & pieces(CANNON)))
+            | (attacks_bb<KNIGHT_TO>(s, occupied) & pieces(KNIGHT))
+            | (attacks_bb<ROOK>(s, occupied) & pieces(KING, ROOK))
+            | (attacks_bb<CANNON>(s, occupied) & pieces(CANNON)))
          & pieces(c);
 }
 
@@ -447,7 +466,7 @@ bool Position::legal(Move m) const {
     // If the moving piece is a king, check whether the destination square is
     // attacked by the opponent.
     if (type_of(piece_on(from)) == KING)
-        return !(attackers_to(to, occupied) & pieces(~us));
+        return !(checkers_to(~us, to, occupied));
 
     // If we don't need slow check. A non-king move is always legal when either:
     // 1. Not moving a pinned piece.
@@ -460,7 +479,36 @@ bool Position::legal(Move m) const {
         return true;
 
     // A non-king move is legal if the king is not under attack after the move.
-    return !(attackers_to(king_square(us), occupied) & ~square_bb(to) & pieces(~us));
+    return !(checkers_to(~us, king_square(us), occupied) & ~square_bb(to));
+}
+
+
+// Takes a random move and tests whether the move is
+// pseudo-legal. It is used to validate moves from TT that can be corrupted
+// due to SMP concurrent access or hash position key aliasing.
+bool Position::pseudo_legal(const Move m) const {
+
+    Color  us   = sideToMove;
+    Square from = m.from_sq();
+    Square to   = m.to_sq();
+    Piece  pc   = moved_piece(m);
+
+    // If the 'from' square is not occupied by a piece belonging to the side to
+    // move, the move is obviously not legal.
+    if (pc == NO_PIECE || color_of(pc) != us)
+        return false;
+
+    // The destination square cannot be occupied by a friendly piece
+    if (pieces(us) & to)
+        return false;
+
+    // Handle the special cases
+    if (type_of(pc) == PAWN)
+        return bool(attacks_bb<PAWN>(from, us) & to);
+    else if (type_of(pc) == CANNON && !capture(m))
+        return bool(attacks_bb<ROOK>(from, pieces()) & to);
+    else
+        return bool(attacks_bb(type_of(pc), from, pieces()) & to);
 }
 
 
@@ -493,6 +541,7 @@ bool Position::gives_check(Move m) const {
 
     return false;
 }
+
 
 // Makes a move, and saves all information necessary
 // to a StateInfo object. The move is assumed to be legal. Pseudo-legal
@@ -906,10 +955,10 @@ bool Position::chase_legal(Move m) const {
     // If the moving piece is a king, check whether the destination
     // square is not under new attack after the move.
     if (type_of(piece_on(from)) == KING)
-        return !(attackers_to(to, occupied) & pieces(~us));
+        return !(checkers_to(~us, to, occupied));
 
     // A non-king move is chase legal if the king is not under new attack after the move.
-    return !(attackers_to(king_square(us), occupied) & ~square_bb(to) & pieces(~us));
+    return !(checkers_to(~us, king_square(us), occupied) & ~square_bb(to));
 }
 
 
