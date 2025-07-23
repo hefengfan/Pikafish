@@ -520,873 +520,274 @@ void Search::Worker::clear() {
 
 // Main search function for both PV and non-PV nodes
 template<NodeType nodeType>
-Value Search::Worker::search(
-  Position& pos, Stack* ss, Value alpha, Value beta, Depth depth, bool cutNode) {
+Value Search::Worker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta) {
 
-    constexpr bool PvNode   = nodeType != NonPV;
-    constexpr bool rootNode = nodeType == Root;
-    const bool     allNode  = !(PvNode || cutNode);
+    static_assert(nodeType != Root);
+    constexpr bool PvNode = nodeType == PV;
 
-    // Dive into quiescence search when the depth reaches zero
-    if (depth <= 0)
+    assert(alpha >= -VALUE_INFINITE && alpha < beta && beta <= VALUE_INFINITE);
+    assert(PvNode || (alpha == beta - 1));
+
+    Move      pv[MAX_PLY + 1];
+    StateInfo st;
+
+    Key   posKey;
+    Move  move, bestMove;
+    Value bestValue, value, futilityBase;
+    bool  givesCheck, capture;
+    int   moveCount;
+
+    // Step 1. Initialize node
+    if (PvNode)
+    {
+        (ss + 1)->pv = pv;
+        ss->pv[0]    = Move::none();
+    }
+
+    Worker* thisThread = this;
+    bestMove           = Move::none();
+    ss->inCheck        = bool(pos.checkers());
+    moveCount          = 0;
+
+    // Used to send selDepth info to GUI (selDepth counts from 1, ply from 0)
+    if (PvNode && thisThread->selDepth < ss->ply + 1)
+        thisThread->selDepth = ss->ply + 1;
+
+    // Step 2. Check for repetition or maximum ply reached
+    Value result = VALUE_NONE;
+    if (pos.rule_judge(result, ss->ply))
+        return result;
+
+    // Optimized handling of rule_judge result
+    if (result != VALUE_NONE)
+    {
+        // 2 fold result is mate for us, the only chance for the opponent is to get a draw
+        // We can guarantee to get at least a draw score during searching for that line
+        if (result > VALUE_DRAW)
+            alpha = std::max(alpha, VALUE_DRAW);
+        // 2 fold result is mated for us, the only chance for us is to get a draw
+        // We can guarantee to get no more than a draw score during searching for that line
+        else // result < VALUE_DRAW
+            beta = std::min(beta, VALUE_DRAW);
+
+        if (alpha >= beta)
+            return alpha;
+    }
+
+    if (ss->ply >= MAX_PLY)
+        return !ss->inCheck ? evaluate(pos) : VALUE_DRAW;
+
+    assert(0 <= ss->ply && ss->ply < MAX_PLY);
+
+    // Step 3. Transposition table lookup
+    posKey                         = pos.key();
+    auto [ttHit, ttData, ttWriter] = tt.probe(posKey);
+    // Need further processing of the saved data
+    ss->ttHit    = ttHit;
+    ttData.move  = ttHit ? ttData.move : Move::none();
+    ttData.value = ttHit ? value_from_tt(ttData.value, ss->ply, pos.rule60_count()) : VALUE_NONE;
+    bool pvHit        = ttHit && ttData.is_pv; // Renamed to avoid shadowing
+
+    // At non-PV nodes we check for an early TT cutoff
+    if (!PvNode && ttData.depth >= DEPTH_QS
+        && is_valid(ttData.value)  // Can happen when !ttHit or when access race in probe()
+        && (ttData.bound & (ttData.value >= beta ? BOUND_LOWER : BOUND_UPPER)))
+        return ttData.value;
+
+    // Step 4. Static evaluation of the position
+    Value unadjustedStaticEval = VALUE_NONE;
+    if (ss->inCheck)
+        bestValue = futilityBase = -VALUE_INFINITE;
+    else
+    {
+        const auto correctionValue = correction_value(*thisThread, pos, ss);
+
+        if (ttHit) // Use local ttHit variable
+        {
+            // Never assume anything about values stored in TT
+            unadjustedStaticEval = ttData.eval;
+            if (!is_valid(unadjustedStaticEval))
+                unadjustedStaticEval = evaluate(pos);
+            ss->staticEval = bestValue =
+              to_corrected_static_eval(unadjustedStaticEval, correctionValue);
+
+            // ttValue can be used as a better position evaluation
+            if (is_valid(ttData.value) && !is_decisive(ttData.value)
+                && (ttData.bound & (ttData.value >= bestValue ? BOUND_LOWER : BOUND_UPPER))) // >= for symmetry with beta test
+                bestValue = ttData.value;
+        }
+        else
+        {
+            unadjustedStaticEval = evaluate(pos);
+
+            ss->staticEval = bestValue =
+              to_corrected_static_eval(unadjustedStaticEval, correctionValue);
+        }
+
+        // Stand pat. Return immediately if static value is at least beta
+        if (bestValue >= beta) [[likely]]
+        {
+            if (!is_decisive(bestValue))
+                bestValue = (bestValue + beta) / 2;
+            if (!ttHit) // Use local ttHit variable
+                ttWriter.write(posKey, value_to_tt(bestValue, ss->ply), false, BOUND_LOWER,
+                               DEPTH_UNSEARCHED, Move::none(), unadjustedStaticEval,
+                               tt.generation());
+            return bestValue;
+        }
+
+        if (bestValue > alpha)
+            alpha = bestValue;
+
+        futilityBase = ss->staticEval + 219;
+    }
+
+    // Pre-calculate common values
+    const PieceToHistory* contHist0 = (ss - 1)->continuationHistory;
+    const PieceToHistory* contHist1 = (ss - 2)->continuationHistory; // Use a dedicated pointer
+    Square prevSq = ((ss - 1)->currentMove).is_ok() ? ((ss - 1)->currentMove).to_sq() : SQ_NONE;
+
+    // Initialize a MovePicker object for the current position, and prepare to search
+    // the moves. We presently use two stages of move generator in quiescence search:
+    // captures, or evasions only when in check.
+    MovePicker mp(pos, ttData.move, DEPTH_QS, &thisThread->mainHistory, &thisThread->lowPlyHistory,
+                  &thisThread->captureHistory, {contHist0, contHist1}, &thisThread->pawnHistory, ss->ply);
+
+    // Step 5. Loop through all pseudo-legal moves until no moves remain or a beta
+    // cutoff occurs.
+    while ((move = mp.next_move()) != Move::none())
+    {
+        assert(move.is_ok());
+
+        if (!pos.legal(move)) [[unlikely]]
+            continue;
+
+        givesCheck = pos.gives_check(move);
+        capture    = pos.capture(move);
+
+        moveCount++;
+
+        // Step 6. Pruning
+        if (!is_loss(bestValue))
+        {
+            // Futility pruning and moveCount pruning
+            // Combine conditions for clarity and potential short-circuiting
+            if (!givesCheck && move.to_sq() != prevSq && !is_loss(futilityBase))
+            {
+                if (moveCount > 2) [[unlikely]]
+                    continue;
+
+                // Pre-calculate PieceValue
+                Value targetPieceValue = PieceValue[pos.piece_on(move.to_sq())];
+                Value futilityValue = futilityBase + targetPieceValue;
+
+                // If static eval + value of piece we are going to capture is
+                // much lower than alpha, we can prune this move.
+                if (futilityValue <= alpha) [[unlikely]]
+                {
+                    bestValue = std::max(bestValue, futilityValue);
+                    continue;
+                }
+
+                // If static exchange evaluation is low enough
+                // we can prune this move.
+                if (!pos.see_ge(move, alpha - futilityBase)) [[unlikely]]
+                {
+                    bestValue = std::min(alpha, futilityBase);
+                    continue;
+                }
+            }
+
+            // Continuation history based pruning
+            Piece movedPiece = pos.moved_piece(move); // Pre-calculate
+            Square toSq = move.to_sq(); // Pre-calculate
+            if (!capture &&
+                contHist0[movedPiece][toSq] +
+                thisThread->pawnHistory[pawn_structure_index(pos)][movedPiece][toSq] <= 2745) [[unlikely]]
+                continue;
+
+            // Do not search moves with bad enough SEE values
+            if (!pos.see_ge(move, -108)) [[unlikely]]
+                continue;
+        }
+
+        // Step 7. Make and search the move
+        Piece movedPiece = pos.moved_piece(move); // Already calculated
+        Square toSq = move.to_sq(); // Already calculated
+
+        do_move(pos, move, st, givesCheck);
+
+        // Update the current move
+        ss->currentMove = move;
+        ss->continuationHistory =
+          &thisThread->continuationHistory[ss->inCheck][capture][movedPiece][toSq];
+        ss->continuationCorrectionHistory =
+          &thisThread->continuationCorrectionHistory[movedPiece][toSq];
+
+        value = -qsearch<nodeType>(pos, ss + 1, -beta, -alpha);
+        undo_move(pos, move);
+
+        assert(value > -VALUE_INFINITE && value < VALUE_INFINITE);
+
+        // Step 8. Check for a new best move
+        if (value > bestValue)
+        {
+            bestValue = value;
+
+            if (value > alpha)
+            {
+                bestMove = move;
+
+                if (PvNode)  // Update pv even in fail-high case
+                    update_pv(ss->pv, move, (ss + 1)->pv);
+
+                if (value < beta)  // Update alpha here!
+                    alpha = value;
+                else
+                    break;  // Fail high
+            }
+        }
+    }
+
+    // Step 9. Check for mate
+    // All legal moves have been searched. A special case: if no legal
+    // moves were found, it is checkmate.
+    // Optimized mate check to avoid full MoveList<LEGAL> if moveCount is not zero
+    if ((bestValue == -VALUE_INFINITE && ss->inCheck) || // If in check and no moves found to escape
+        (moveCount == 0 && !ss->inCheck && !MoveList<LEGAL>(pos).size())) // If not in check, no moves, and not stalemate
+    {
+        return mated_in(ss->ply);  // Plies to mate from the root
+    }
+    // If bestValue == -VALUE_INFINITE but not in check, it implies stalemate (no legal moves, but not in check)
+    // The previous logic for !moveCount && lambda was effectively checking for stalemate.
+    // If moveCount == 0 and not inCheck, and there are no legal moves, it's stalemate.
+    // Otherwise, it's still possible to have moves, but they were all pruned.
+    if (moveCount == 0 && !ss->inCheck) // This catches cases where all moves were pruned but it's not mate/stalemate.
+                                        // This means we might have returned a bad value. Re-evaluate.
     {
-        constexpr auto nt = PvNode ? PV : NonPV;
-        return qsearch<nt>(pos, ss, alpha, beta);
-    }
-
-    // Limit the depth if extensions made it too large
-    depth = std::min(depth, MAX_PLY - 1);
-
-    assert(-VALUE_INFINITE <= alpha && alpha < beta && beta <= VALUE_INFINITE);
-    assert(PvNode || (alpha == beta - 1));
-    assert(0 < depth && depth < MAX_PLY);
-    assert(!(PvNode && cutNode));
-
-    Move      pv[MAX_PLY + 1];
-    StateInfo st;
-
-    Key   posKey;
-    Move  move, excludedMove, bestMove;
-    Depth extension, newDepth;
-    Value bestValue, value, eval, maxValue, probCutBeta;
-    bool  givesCheck, improving, priorCapture, opponentWorsening;
-    bool  capture, ttCapture;
-    int   priorReduction;
-    Piece movedPiece;
-
-    SearchedList capturesSearched;
-    SearchedList quietsSearched;
-
-    // Step 1. Initialize node
-    Worker* thisThread = this;
-    ss->inCheck        = bool(pos.checkers());
-    priorCapture       = pos.captured_piece();
-    Color us           = pos.side_to_move();
-    ss->moveCount      = 0;
-    bestValue          = -VALUE_INFINITE;
-    maxValue           = VALUE_INFINITE;
-
-    // Check for the available remaining time
-    if (is_mainthread())
-        main_manager()->check_time(*thisThread);
-
-    // Used to send selDepth info to GUI (selDepth counts from 1, ply from 0)
-    if (PvNode && thisThread->selDepth < ss->ply + 1)
-        thisThread->selDepth = ss->ply + 1;
-
-    if (!rootNode)
-    {
-        // Step 2. Check for aborted search and repetition
-        Value result = VALUE_NONE;
-        if (pos.rule_judge(result, ss->ply))
-            return result == VALUE_DRAW ? value_draw(thisThread->nodes) : result;
-        if (result != VALUE_NONE)
-        {
-            assert(result != VALUE_DRAW);
-
-            // 2 fold result is mate for us, the only chance for the opponent is to get a draw
-            // We can guarantee to get at least a draw score during searching for that line
-            if (result > VALUE_DRAW)
-                alpha = std::max(alpha, VALUE_DRAW - 1);
-            // 2 fold result is mated for us, the only chance for us is to get a draw
-            // We can guarantee to get no more than a draw score during searching for that line
-            else
-                beta = std::min(beta, VALUE_DRAW + 1);
-        }
-
-        if (threads.stop.load(std::memory_order_relaxed) || ss->ply >= MAX_PLY)
-            return (ss->ply >= MAX_PLY && !ss->inCheck) ? evaluate(pos)
-                                                        : value_draw(thisThread->nodes);
-
-        // Step 3. Mate distance pruning. Even if we mate at the next move our score
-        // would be at best mate_in(ss->ply + 1), but if alpha is already bigger because
-        // a shorter mate was found upward in the tree then there is no need to search
-        // because we will never beat the current alpha. Same logic but with reversed
-        // signs apply also in the opposite condition of being mated instead of giving
-        // mate. In this case, return a fail-high score.
-        alpha = std::max(mated_in(ss->ply), alpha);
-        beta  = std::min(mate_in(ss->ply + 1), beta);
-        if (alpha >= beta)
-            return alpha;
-    }
-
-    assert(0 <= ss->ply && ss->ply < MAX_PLY);
-
-    Square prevSq  = ((ss - 1)->currentMove).is_ok() ? ((ss - 1)->currentMove).to_sq() : SQ_NONE;
-    bestMove       = Move::none();
-    priorReduction = (ss - 1)->reduction;
-    (ss - 1)->reduction = 0;
-    ss->statScore       = 0;
-    ss->isPvNode        = PvNode;
-    (ss + 2)->cutoffCnt = 0;
-
-    // Step 4. Transposition table lookup
-    excludedMove                   = ss->excludedMove;
-    posKey                         = pos.key();
-    auto [ttHit, ttData, ttWriter] = tt.probe(posKey);
-    // Need further processing of the saved data
-    ss->ttHit    = ttHit;
-    ttData.move  = rootNode ? thisThread->rootMoves[thisThread->pvIdx].pv[0]
-                 : ttHit    ? ttData.move
-                            : Move::none();
-    ttData.value = ttHit ? value_from_tt(ttData.value, ss->ply, pos.rule60_count()) : VALUE_NONE;
-    ss->ttPv     = excludedMove ? ss->ttPv : PvNode || (ttHit && ttData.is_pv);
-    ttCapture    = ttData.move && pos.capture(ttData.move);
-
-    // At this point, if excluded, skip straight to step 5, static eval. However,
-    // to save indentation, we list the condition in all code between here and there.
-
-    // At non-PV nodes we check for an early TT cutoff
-    if (!PvNode && !excludedMove && ttData.depth > depth - (ttData.value <= beta)
-        && is_valid(ttData.value)  // Can happen when !ttHit or when access race in probe()
-        && (ttData.bound & (ttData.value >= beta ? BOUND_LOWER : BOUND_UPPER))
-        && (cutNode == (ttData.value >= beta) || depth > 5))
-    {
-        // If ttMove is quiet, update move sorting heuristics on TT hit
-        if (ttData.move && ttData.value >= beta)
-        {
-            // Bonus for a quiet ttMove that fails high
-            if (!ttCapture)
-                update_quiet_histories(pos, ss, *this, ttData.move,
-                                       std::min(112 * depth - 62, 1525));
-
-            // Extra penalty for early quiet moves of the previous ply
-            if (prevSq != SQ_NONE && (ss - 1)->moveCount <= 2 && !priorCapture)
-                update_continuation_histories(ss - 1, pos.piece_on(prevSq), prevSq, -2250);
-        }
-
-        // Partial workaround for the graph history interaction problem
-        // For high rule60 counts don't produce transposition table cutoffs.
-        if (pos.rule60_count() < 110)
-        {
-            if (depth >= 8 && ttData.move && pos.pseudo_legal(ttData.move) && pos.legal(ttData.move)
-                && !is_decisive(ttData.value))
-            {
-                do_move(pos, ttData.move, st);
-                Key nextPosKey                             = pos.key();
-                auto [ttHitNext, ttDataNext, ttWriterNext] = tt.probe(nextPosKey);
-                undo_move(pos, ttData.move);
-
-                // Check that the ttValue after the tt move would also trigger a cutoff
-                if (!is_valid(ttDataNext.value))
-                    return ttData.value;
-                if ((ttData.value >= beta) == (-ttDataNext.value >= beta))
-                    return ttData.value;
-            }
-            else
-                return ttData.value;
-        }
-    }
-
-    // Step 5. Static evaluation of the position
-    Value      unadjustedStaticEval = VALUE_NONE;
-    const auto correctionValue      = correction_value(*thisThread, pos, ss);
-    if (ss->inCheck)
-    {
-        // Skip early pruning when in check
-        ss->staticEval = eval = (ss - 2)->staticEval;
-        improving             = false;
-        goto moves_loop;
-    }
-    else if (excludedMove)
-        unadjustedStaticEval = eval = ss->staticEval;
-    else if (ss->ttHit)
-    {
-        // Never assume anything about values stored in TT
-        unadjustedStaticEval = ttData.eval;
-        if (!is_valid(unadjustedStaticEval))
-            unadjustedStaticEval = evaluate(pos);
-
-        ss->staticEval = eval = to_corrected_static_eval(unadjustedStaticEval, correctionValue);
-
-        // ttValue can be used as a better position evaluation
-        if (is_valid(ttData.value)
-            && (ttData.bound & (ttData.value > eval ? BOUND_LOWER : BOUND_UPPER)))
-            eval = ttData.value;
-    }
-    else
-    {
-        unadjustedStaticEval = evaluate(pos);
-        ss->staticEval = eval = to_corrected_static_eval(unadjustedStaticEval, correctionValue);
-
-        // Static evaluation is saved as it was before adjustment by correction history
-        ttWriter.write(posKey, VALUE_NONE, ss->ttPv, BOUND_NONE, DEPTH_UNSEARCHED, Move::none(),
-                       unadjustedStaticEval, tt.generation());
-    }
-
-    // Use static evaluation difference to improve quiet move ordering
-    if (((ss - 1)->currentMove).is_ok() && !(ss - 1)->inCheck && !priorCapture && !ttHit)
-    {
-        int bonus = std::clamp(-18 * int((ss - 1)->staticEval + ss->staticEval), -1056, 2024) + 341;
-        thisThread->mainHistory[~us][((ss - 1)->currentMove).from_to()] << bonus * 1284 / 1024;
-        if (type_of(pos.piece_on(prevSq)) != PAWN)
-            thisThread->pawnHistory[pawn_structure_index(pos)][pos.piece_on(prevSq)][prevSq]
-              << bonus * 1254 / 1024;
-    }
-
-    // Set up the improving flag, which is true if current static evaluation is
-    // bigger than the previous static evaluation at our turn (if we were in
-    // check at our previous move we go back until we weren't in check) and is
-    // false otherwise. The improving flag is used in various pruning heuristics.
-    improving = ss->staticEval > (ss - 2)->staticEval;
-
-    opponentWorsening = ss->staticEval > -(ss - 1)->staticEval;
-
-    if (priorReduction >= 3 && !opponentWorsening)
-        depth++;
-    if (priorReduction >= 1 && depth >= 2 && ss->staticEval + (ss - 1)->staticEval > 200)
-        depth--;
-
-    // Step 6. Razoring
-    // If eval is really low, skip search entirely and return the qsearch value.
-    // For PvNodes, we must have a guard against mates being returned.
-    if (!PvNode && eval < alpha - 1408 - 246 * depth * depth)
-        return qsearch<NonPV>(pos, ss, alpha, beta);
-
-    // Step 7. Futility pruning: child node
-    // The depth condition is important for mate finding.
-    {
-        auto futility_margin = [&](Depth d) {
-            Value futilityMult = 137 - 32 * (cutNode && !ss->ttHit);
-
-            return futilityMult * d                      //
-                 - improving * futilityMult * 2          //
-                 - opponentWorsening * futilityMult / 3  //
-                 + (ss - 1)->statScore / 149             //
-                 + std::abs(correctionValue) / 130668;
-        };
-
-        if (!ss->ttPv && depth < 15 && eval - futility_margin(depth) >= beta && eval >= beta
-            && (!ttData.move || ttCapture) && !is_loss(beta) && !is_win(eval))
-            return beta + (eval - beta) / 3;
-    }
-
-    // Step 8. Null move search with verification search
-    if (cutNode && (ss - 1)->currentMove != Move::null() && eval >= beta
-        && ss->staticEval >= beta - 8 * depth + 188 && !excludedMove && pos.major_material(us)
-        && ss->ply >= thisThread->nmpMinPly && !is_loss(beta))
-    {
-        assert(eval - beta >= 0);
-
-        // Null move dynamic reduction based on depth
-        Depth R = 7 + depth / 3;
-
-        ss->currentMove                   = Move::null();
-        ss->continuationHistory           = &thisThread->continuationHistory[0][0][NO_PIECE][0];
-        ss->continuationCorrectionHistory = &thisThread->continuationCorrectionHistory[NO_PIECE][0];
-
-        do_null_move(pos, st);
-
-        Value nullValue = -search<NonPV>(pos, ss + 1, -beta, -beta + 1, depth - R, false);
-
-        undo_null_move(pos);
-
-        // Do not return unproven mate
-        if (nullValue >= beta && !is_win(nullValue))
-        {
-            if (thisThread->nmpMinPly || depth < 15)
-                return nullValue;
-
-            assert(!thisThread->nmpMinPly);  // Recursive verification is not allowed
-
-            // Do verification search at high depths, with null move pruning disabled
-            // until ply exceeds nmpMinPly.
-            thisThread->nmpMinPly = ss->ply + 3 * (depth - R) / 4;
-
-            Value v = search<NonPV>(pos, ss, beta - 1, beta, depth - R, false);
-
-            thisThread->nmpMinPly = 0;
-
-            if (v >= beta)
-                return nullValue;
-        }
-    }
-
-    improving |= ss->staticEval >= beta + 119;
-
-    // Step 9. Internal iterative reductions
-    // For PV nodes without a ttMove as well as for deep enough cutNodes, we decrease depth.
-    // (*Scaler) Especially if they make IIR less aggressive.
-    if (!allNode && depth >= 6 && !ttData.move)
-        depth--;
-
-    // Step 10. ProbCut
-    // If we have a good enough capture and a reduced search
-    // returns a value much above beta, we can (almost) safely prune the previous move.
-    probCutBeta = beta + 246 - 63 * improving;
-    if (depth >= 3
-        && !is_decisive(beta)
-        // If value from transposition table is lower than probCutBeta, don't attempt
-        // probCut there
-        && !(is_valid(ttData.value) && ttData.value < probCutBeta))
-    {
-        assert(probCutBeta < VALUE_INFINITE && probCutBeta > beta);
-
-        MovePicker mp(pos, ttData.move, probCutBeta - ss->staticEval, &thisThread->captureHistory);
-        Depth      probCutDepth = std::max(depth - 5, 0);
-
-        while ((move = mp.next_move()) != Move::none())
-        {
-            assert(move.is_ok());
-
-            if (move == excludedMove || !pos.legal(move))
-                continue;
-
-            assert(pos.capture(move));
-
-            movedPiece = pos.moved_piece(move);
-
-            do_move(pos, move, st);
-
-            ss->currentMove = move;
-            ss->continuationHistory =
-              &this->continuationHistory[ss->inCheck][true][movedPiece][move.to_sq()];
-            ss->continuationCorrectionHistory =
-              &this->continuationCorrectionHistory[movedPiece][move.to_sq()];
-
-            // Perform a preliminary qsearch to verify that the move holds
-            value = -qsearch<NonPV>(pos, ss + 1, -probCutBeta, -probCutBeta + 1);
-
-            // If the qsearch held, perform the regular search
-            if (value >= probCutBeta && probCutDepth > 0)
-                value = -search<NonPV>(pos, ss + 1, -probCutBeta, -probCutBeta + 1, probCutDepth,
-                                       !cutNode);
-
-            undo_move(pos, move);
-
-            if (value >= probCutBeta)
-            {
-                // Save ProbCut data into transposition table
-                ttWriter.write(posKey, value_to_tt(value, ss->ply), ss->ttPv, BOUND_LOWER,
-                               probCutDepth + 1, move, unadjustedStaticEval, tt.generation());
-
-                if (!is_decisive(value))
-                    return value - (probCutBeta - beta);
-            }
-        }
-    }
-
-moves_loop:  // When in check, search starts here
-
-    // Step 11. A small Probcut idea
-    probCutBeta = beta + 451;
-    if ((ttData.bound & BOUND_LOWER) && ttData.depth >= depth - 4 && ttData.value >= probCutBeta
-        && !is_decisive(beta) && is_valid(ttData.value) && !is_decisive(ttData.value))
-        return probCutBeta;
-
-    const PieceToHistory* contHist[] = {
-      (ss - 1)->continuationHistory, (ss - 2)->continuationHistory, (ss - 3)->continuationHistory,
-      (ss - 4)->continuationHistory, (ss - 5)->continuationHistory, (ss - 6)->continuationHistory};
-
-
-    MovePicker mp(pos, ttData.move, depth, &thisThread->mainHistory, &thisThread->lowPlyHistory,
-                  &thisThread->captureHistory, contHist, &thisThread->pawnHistory, ss->ply);
-
-    value = bestValue;
-
-    int moveCount = 0;
-
-    // Step 12. Loop through all pseudo-legal moves until no moves remain
-    // or a beta cutoff occurs.
-    while ((move = mp.next_move()) != Move::none())
-    {
-        assert(move.is_ok());
-
-        if (move == excludedMove)
-            continue;
-
-        // Check for legality
-        if (!pos.legal(move))
-            continue;
-
-        // At root obey the "searchmoves" option and skip moves not listed in Root Move List.
-        // In MultiPV mode we also skip PV moves that have been already searched.
-        if (rootNode
-            && !std::count(thisThread->rootMoves.begin() + thisThread->pvIdx,
-                           thisThread->rootMoves.begin() + thisThread->pvLast, move))
-            continue;
-
-        ss->moveCount = ++moveCount;
-
-        if (rootNode && is_mainthread() && nodes > 10000000)
-        {
-            main_manager()->updates.onIter(
-              {depth, UCIEngine::move(move), moveCount + thisThread->pvIdx});
-        }
-        if (PvNode)
-            (ss + 1)->pv = nullptr;
-
-        extension  = 0;
-        capture    = pos.capture(move);
-        movedPiece = pos.moved_piece(move);
-        givesCheck = pos.gives_check(move);
-
-        (ss + 1)->quietMoveStreak = (!capture && !givesCheck) ? (ss->quietMoveStreak + 1) : 0;
-
-        // Calculate new depth for this move
-        newDepth = depth - 1;
-
-        int delta = beta - alpha;
-
-        Depth r = reduction(improving, depth, moveCount, delta);
-
-        // Increase reduction for ttPv nodes (*Scaler)
-        // Smaller or even negative value is better for short time controls
-        // Bigger value is better for long time controls
-        if (ss->ttPv)
-            r += 932;
-
-        // Step 13. Pruning at shallow depth.
-        // Depth conditions are important for mate finding.
-        if (!rootNode && pos.major_material(us) && !is_loss(bestValue))
-        {
-            // Skip quiet moves if movecount exceeds our FutilityMoveCount threshold
-            if (moveCount >= (3 + depth * depth) / (2 - improving))
-                mp.skip_quiet_moves();
-
-            // Reduced depth of the next LMR search
-            int lmrDepth = newDepth - r / 1020;
-
-            if (capture || givesCheck)
-            {
-                Piece capturedPiece = pos.piece_on(move.to_sq());
-                int   captHist =
-                  thisThread->captureHistory[movedPiece][move.to_sq()][type_of(capturedPiece)];
-
-                // Futility pruning for captures
-                if (!givesCheck && lmrDepth < 19 && !ss->inCheck)
-                {
-                    Value futilityValue = ss->staticEval + 318 + 350 * lmrDepth
-                                        + PieceValue[capturedPiece] + 106 * captHist / 466;
-                    if (futilityValue <= alpha)
-                        continue;
-                }
-
-                // SEE based pruning for captures and checks
-                int seeHist = std::clamp(captHist / 31, -249 * depth, 193 * depth);
-                if (!pos.see_ge(move, -246 * depth - seeHist))
-                    continue;
-            }
-            else
-            {
-                int history =
-                  (*contHist[0])[movedPiece][move.to_sq()]
-                  + (*contHist[1])[movedPiece][move.to_sq()]
-                  + thisThread->pawnHistory[pawn_structure_index(pos)][movedPiece][move.to_sq()];
-
-                // Continuation history based pruning
-                if (history < -3051 * depth)
-                    continue;
-
-                history += 69 * thisThread->mainHistory[us][move.from_to()] / 29;
-
-                lmrDepth += history / 3654;
-
-                Value baseFutility = (bestMove ? 46 : 282);
-                Value futilityValue =
-                  ss->staticEval + baseFutility + 124 * lmrDepth + 104 * (ss->staticEval > alpha);
-
-                // Futility pruning: parent node
-                // (*Scaler): Generally, more frequent futility pruning
-                // scales well with respect to time and threads
-                if (!ss->inCheck && lmrDepth < 10 && futilityValue <= alpha)
-                {
-                    if (bestValue <= futilityValue && !is_decisive(bestValue)
-                        && !is_win(futilityValue))
-                        bestValue = futilityValue;
-                    continue;
-                }
-
-                lmrDepth = std::max(lmrDepth, 0);
-
-                // Prune moves with negative SEE
-                if (!pos.see_ge(move, -35 * lmrDepth * lmrDepth))
-                    continue;
-            }
-        }
-
-        // Step 14. Extensions
-        // Singular extension search. If all moves but one
-        // fail low on a search of (alpha-s, beta-s), and just one fails high on
-        // (alpha, beta), then that move is singular and should be extended. To
-        // verify this we do a reduced search on the position excluding the ttMove
-        // and if the result is lower than ttValue minus a margin, then we will
-        // extend the ttMove. Recursive singular search is avoided.
-
-        // (*Scaler) Generally, higher singularBeta (i.e closer to ttValue)
-        // and lower extension margins scale well.
-
-        if (!rootNode && move == ttData.move && !excludedMove
-            && depth >= 5 - (thisThread->completedDepth > 32) + ss->ttPv && is_valid(ttData.value)
-            && !is_decisive(ttData.value) && (ttData.bound & BOUND_LOWER)
-            && ttData.depth >= depth - 3)
-        {
-            Value singularBeta  = ttData.value - (43 + 70 * (ss->ttPv && !PvNode)) * depth / 75;
-            Depth singularDepth = newDepth / 2;
-
-            ss->excludedMove = move;
-            value = search<NonPV>(pos, ss, singularBeta - 1, singularBeta, singularDepth, cutNode);
-            ss->excludedMove = Move::none();
-
-            if (value < singularBeta)
-            {
-                int corrValAdj   = std::abs(correctionValue) / 261908;
-                int doubleMargin = -4 + 236 * PvNode - 176 * !ttCapture - corrValAdj
-                                 - 1025 * ttMoveHistory / 132363
-                                 - (ss->ply > thisThread->rootDepth) * 43;
-                int tripleMargin = 95 + 271 * PvNode - 243 * !ttCapture + 97 * ss->ttPv - corrValAdj
-                                 - (ss->ply * 2 > thisThread->rootDepth * 3) * 56;
-
-                extension =
-                  1 + (value < singularBeta - doubleMargin) + (value < singularBeta - tripleMargin);
-
-                depth++;
-            }
-
-            // Multi-cut pruning
-            // Our ttMove is assumed to fail high based on the bound of the TT entry,
-            // and if after excluding the ttMove with a reduced search we fail high
-            // over the original beta, we assume this expected cut-node is not
-            // singular (multiple moves fail high), and we can prune the whole
-            // subtree by returning a softbound.
-            else if (value >= beta && !is_decisive(value))
-                return value;
-
-            // Negative extensions
-            // If other moves failed high over (ttValue - margin) without the
-            // ttMove on a reduced search, but we cannot do multi-cut because
-            // (ttValue - margin) is lower than the original beta, we do not know
-            // if the ttMove is singular or can do a multi-cut, so we reduce the
-            // ttMove in favor of other moves based on some conditions:
-
-            // If the ttMove is assumed to fail high over current beta
-            else if (ttData.value >= beta)
-                extension = -3;
-
-            // If we are on a cutNode but the ttMove is not assumed to fail high
-            // over current beta
-            else if (cutNode)
-                extension = -2;
-        }
-
-        // Step 15. Make the move
-        do_move(pos, move, st, givesCheck);
-
-        // Add extension to new depth
-        newDepth += extension;
-
-        // Update the current move (this must be done after singular extension search)
-        ss->currentMove = move;
-        ss->continuationHistory =
-          &thisThread->continuationHistory[ss->inCheck][capture][movedPiece][move.to_sq()];
-        ss->continuationCorrectionHistory =
-          &thisThread->continuationCorrectionHistory[movedPiece][move.to_sq()];
-        uint64_t nodeCount = rootNode ? uint64_t(nodes) : 0;
-
-        // Decrease reduction for PvNodes (*Scaler)
-        if (ss->ttPv)
-            r -= 2163 + PvNode * 1018 + (ttData.value > alpha) * 1038
-               + (ttData.depth >= depth) * (1077 + cutNode * 921);
-
-        // These reduction adjustments have no proven non-linear scaling
-
-        r += 327;  // Base reduction offset to compensate for other tweaks
-        r -= moveCount * 62;
-        r -= std::abs(correctionValue) / 31508;
-
-        // Increase reduction for cut nodes
-        if (cutNode)
-            r += 3345 + 961 * !ttData.move;
-
-        // Increase reduction if ttMove is a capture
-        if (ttCapture)
-            r += 1361 + (depth < 8) * 1442;
-
-        // Increase reduction if next ply has a lot of fail high
-        if ((ss + 1)->cutoffCnt > 2)
-            r += 1227 + allNode * 888;
-
-        r += (ss + 1)->quietMoveStreak * 51;
-
-        // For first picked move (ttMove) reduce reduction
-        if (move == ttData.move)
-            r -= 2890;
-
-        if (capture)
-            ss->statScore =
-              722 * int(PieceValue[pos.captured_piece()]) / 105
-              + thisThread->captureHistory[movedPiece][move.to_sq()][type_of(pos.captured_piece())]
-              - 4785;
+        // This is a "no moves generated by MovePicker" case, which implies
+        // that either all captures/evasions were pruned, or there were none.
+        // In quiescent search, if no moves were found, and we are not in check,
+        // it means the static eval is the best we can do.
+        if (bestValue == -VALUE_INFINITE) // Should only happen if in check
+            return VALUE_DRAW; // Stalemate if no moves and not in check (if not already caught by rule_judge)
         else
-            ss->statScore = 2 * thisThread->mainHistory[us][move.from_to()]
-                          + (*contHist[0])[movedPiece][move.to_sq()]
-                          + (*contHist[1])[movedPiece][move.to_sq()] - 4180;
-
-        // Decrease/increase reduction for moves with a good/bad history
-        r -= ss->statScore * 1235 / 10022;
-
-        // Step 16. Late moves reduction / extension (LMR)
-        if (depth >= 2 && moveCount > 1)
-        {
-            // In general we want to cap the LMR depth search at newDepth, but when
-            // reduction is negative, we allow this move a limited search extension
-            // beyond the first move depth.
-            // To prevent problems when the max value is less than the min value,
-            // std::clamp has been replaced by a more robust implementation.
-            Depth d = std::max(1, std::min(newDepth - r / 1060,
-                                           newDepth + !allNode + (PvNode && !bestMove)))
-                    + (ss - 1)->isPvNode;
-
-            ss->reduction = newDepth - d;
-            value         = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha, d, true);
-            ss->reduction = 0;
-
-            // Do a full-depth search when reduced LMR search fails high
-            // (*Scaler) Usually doing more shallower searches
-            // doesn't scale well to longer TCs
-            if (value > alpha && d < newDepth)
-            {
-                // Adjust full-depth search based on LMR results - if the result was
-                // good enough search deeper, if it was bad enough search shallower.
-                const bool doDeeperSearch    = value > (bestValue + 57 + 2 * newDepth);
-                const bool doShallowerSearch = value < bestValue + 9;
-
-                newDepth += doDeeperSearch - doShallowerSearch;
-
-                if (newDepth > d)
-                    value = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha, newDepth, !cutNode);
-
-                // Post LMR continuation history updates
-                update_continuation_histories(ss, movedPiece, move.to_sq(), 1533);
-            }
-            else if (value > alpha && value < bestValue + 9)
-                newDepth--;
-        }
-
-        // Step 17. Full-depth search when LMR is skipped
-        else if (!PvNode || moveCount > 1)
-        {
-            // Increase reduction if ttMove is not present
-            if (!ttData.move)
-                r += 992;
-
-            r -= ttMoveHistory / 8;
-
-            // Note that if expected reduction is high, we reduce search depth here
-            value = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha,
-                                   newDepth - (r > 4055) - (r > 6153 && newDepth > 2), !cutNode);
-        }
-
-        // For PV nodes only, do a full PV search on the first move or after a fail high,
-        // otherwise let the parent node fail low with value <= alpha and try another move.
-        if (PvNode && (moveCount == 1 || value > alpha))
-        {
-            (ss + 1)->pv    = pv;
-            (ss + 1)->pv[0] = Move::none();
-
-            // Extend move from transposition table if we are about to dive into qsearch.
-            if (move == ttData.move && thisThread->rootDepth > 8)
-                newDepth = std::max(newDepth, 1);
-
-            value = -search<PV>(pos, ss + 1, -beta, -alpha, newDepth, false);
-        }
-
-        // Step 18. Undo move
-        undo_move(pos, move);
-
-        assert(value > -VALUE_INFINITE && value < VALUE_INFINITE);
-
-        // Step 19. Check for a new best move
-        // Finished searching the move. If a stop occurred, the return value of
-        // the search cannot be trusted, and we return immediately without updating
-        // best move, principal variation nor transposition table.
-        if (threads.stop.load(std::memory_order_relaxed))
-            return VALUE_ZERO;
-
-        if (rootNode)
-        {
-            RootMove& rm =
-              *std::find(thisThread->rootMoves.begin(), thisThread->rootMoves.end(), move);
-
-            rm.effort += nodes - nodeCount;
-
-            rm.averageScore =
-              rm.averageScore != -VALUE_INFINITE ? (value + rm.averageScore) / 2 : value;
-
-            rm.meanSquaredScore = rm.meanSquaredScore != -VALUE_INFINITE * VALUE_INFINITE
-                                  ? (value * std::abs(value) + rm.meanSquaredScore) / 2
-                                  : value * std::abs(value);
-
-            // PV move or new best move?
-            if (moveCount == 1 || value > alpha)
-            {
-                rm.score = rm.uciScore = value;
-                rm.selDepth            = thisThread->selDepth;
-                rm.scoreLowerbound = rm.scoreUpperbound = false;
-
-                if (value >= beta)
-                {
-                    rm.scoreLowerbound = true;
-                    rm.uciScore        = beta;
-                }
-                else if (value <= alpha)
-                {
-                    rm.scoreUpperbound = true;
-                    rm.uciScore        = alpha;
-                }
-
-                rm.pv.resize(1);
-
-                assert((ss + 1)->pv);
-
-                for (Move* m = (ss + 1)->pv; *m != Move::none(); ++m)
-                    rm.pv.push_back(*m);
-
-                // We record how often the best move has been changed in each iteration.
-                // This information is used for time management. In MultiPV mode,
-                // we must take care to only do this for the first PV line.
-                if (moveCount > 1 && !thisThread->pvIdx)
-                    ++thisThread->bestMoveChanges;
-            }
-            else
-                // All other moves but the PV, are set to the lowest value: this
-                // is not a problem when sorting because the sort is stable and the
-                // move position in the list is preserved - just the PV is pushed up.
-                rm.score = -VALUE_INFINITE;
-        }
-
-        // In case we have an alternative move equal in eval to the current bestmove,
-        // promote it to bestmove by pretending it just exceeds alpha (but not beta).
-        int inc = (value == bestValue && ss->ply + 2 >= thisThread->rootDepth
-                   && (int(nodes) & 15) == 0 && !is_win(std::abs(value) + 1));
-
-        if (value + inc > bestValue)
-        {
-            bestValue = value;
-
-            if (value + inc > alpha)
-            {
-                bestMove = move;
-
-                if (PvNode && !rootNode)  // Update pv even in fail-high case
-                    update_pv(ss->pv, move, (ss + 1)->pv);
-
-                if (value >= beta)
-                {
-                    // (* Scaler) Especially if they make cutoffCnt increment more often.
-                    ss->cutoffCnt += (extension < 2) || PvNode;
-                    assert(value >= beta);  // Fail high
-                    break;
-                }
-
-                // Reduce other moves if we have found at least one score improvement
-                if (depth > 2 && depth < 11 && !is_decisive(value))
-                    depth -= 2;
-
-                assert(depth > 0);
-                alpha = value;  // Update alpha! Always alpha < beta
-            }
-        }
-
-        // If the move is worse than some previously searched move,
-        // remember it, to update its stats later.
-        if (move != bestMove && moveCount <= SEARCHEDLIST_CAPACITY)
-        {
-            if (capture)
-                capturesSearched.push_back(move);
-            else
-                quietsSearched.push_back(move);
-        }
+            return bestValue; // Return the best static eval / stand pat value if no good moves.
     }
 
-    // Step 20. Check for mate
-    // All legal moves have been searched and if there are no legal moves,
-    // it must be a mate. If we are in a singular extension search then
-    // return a fail low score.
 
-    assert(moveCount || !ss->inCheck || excludedMove || !MoveList<LEGAL>(pos).size());
+    if (!is_decisive(bestValue) && bestValue > beta) [[unlikely]]
+        bestValue = (bestValue + beta) / 2;
 
-    // Adjust best value for fail high cases
-    if (bestValue >= beta && !is_decisive(bestValue) && !is_decisive(alpha))
-        bestValue = (bestValue * depth + beta) / (depth + 1);
+    // Save gathered info in transposition table. The static evaluation
+    // is saved as it was before adjustment by correction history.
+    ttWriter.write(posKey, value_to_tt(bestValue, ss->ply), pvHit,
+                   bestValue >= beta ? BOUND_LOWER : BOUND_UPPER, DEPTH_QS, bestMove,
+                   unadjustedStaticEval, tt.generation());
 
-    if (!moveCount)
-        bestValue = excludedMove ? alpha : mated_in(ss->ply);
+    assert(bestValue > -VALUE_INFINITE && bestValue < VALUE_INFINITE);
 
-    // If there is a move that produces search value greater than alpha,
-    // we update the stats of searched moves.
-    else if (bestMove)
-    {
-        update_all_stats(pos, ss, *this, bestMove, prevSq, quietsSearched, capturesSearched, depth,
-                         ttData.move, moveCount);
-        if (!PvNode)
-            ttMoveHistory << (bestMove == ttData.move ? 774 : -844);
-    }
-
-    // Bonus for prior quiet countermove that caused the fail low
-    else if (!priorCapture && prevSq != SQ_NONE)
-    {
-        int bonusScale = -233;
-        bonusScale += std::min(-(ss - 1)->statScore / 74, 238);
-        bonusScale += std::min(60 * depth, 528);
-        bonusScale += 150 * ((ss - 1)->moveCount > 12);
-        bonusScale += 76 * (!ss->inCheck && bestValue <= ss->staticEval - 165);
-        bonusScale += 158 * (!(ss - 1)->inCheck && bestValue <= -(ss - 1)->staticEval - 110);
-
-        bonusScale = std::max(bonusScale, 0);
-
-        const int scaledBonus = std::min(145 * depth - 87, 2078) * bonusScale;
-
-        update_continuation_histories(ss - 1, pos.piece_on(prevSq), prevSq,
-                                      scaledBonus * 371 / 32768);
-
-        thisThread->mainHistory[~us][((ss - 1)->currentMove).from_to()]
-          << scaledBonus * 213 / 32768;
-
-        if (type_of(pos.piece_on(prevSq)) != PAWN)
-            thisThread->pawnHistory[pawn_structure_index(pos)][pos.piece_on(prevSq)][prevSq]
-              << scaledBonus * 992 / 32768;
-    }
-
-    // Bonus for prior capture countermove that caused the fail low
-    else if (priorCapture && prevSq != SQ_NONE)
-    {
-        Piece capturedPiece = pos.captured_piece();
-        assert(capturedPiece != NO_PIECE);
-        thisThread->captureHistory[pos.piece_on(prevSq)][prevSq][type_of(capturedPiece)] << 984;
-    }
-
-    if (PvNode)
-        bestValue = std::min(bestValue, maxValue);
-
-    // If no good move is found and the previous position was ttPv, then the previous
-    // opponent move is probably good and the new position is added to the search tree.
-    if (bestValue <= alpha)
-        ss->ttPv = ss->ttPv || (ss - 1)->ttPv;
-
-    // Write gathered information in transposition table. Note that the
-    // static evaluation is saved as it was before correction history.
-    if (!excludedMove && !(rootNode && thisThread->pvIdx))
-        ttWriter.write(posKey, value_to_tt(bestValue, ss->ply), ss->ttPv,
-                       bestValue >= beta    ? BOUND_LOWER
-                       : PvNode && bestMove ? BOUND_EXACT
-                                            : BOUND_UPPER,
-                       moveCount != 0 ? depth : std::min(MAX_PLY - 1, depth + 6), bestMove,
-                       unadjustedStaticEval, tt.generation());
-
-    // Adjust correction history
-    if (!ss->inCheck && !(bestMove && pos.capture(bestMove))
-        && ((bestValue < ss->staticEval && bestValue < beta)  // negative correction & no fail high
-            || (bestValue > ss->staticEval && bestMove)))     // positive correction & no fail low
-    {
-        auto bonus = std::clamp(int(bestValue - ss->staticEval) * depth / 8,
-                                -CORRECTION_HISTORY_LIMIT / 4, CORRECTION_HISTORY_LIMIT / 4);
-        update_correction_history(pos, ss, *thisThread, bonus);
-    }
-
-    assert(bestValue > -VALUE_INFINITE && bestValue < VALUE_INFINITE);
-
-    return bestValue;
+    return bestValue;
 }
 
 
@@ -1399,255 +800,272 @@ moves_loop:  // When in check, search starts here
 template<NodeType nodeType>
 Value Search::Worker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta) {
 
-    static_assert(nodeType != Root);
-    constexpr bool PvNode = nodeType == PV;
+    static_assert(nodeType != Root);
+    constexpr bool PvNode = nodeType == PV;
 
-    assert(alpha >= -VALUE_INFINITE && alpha < beta && beta <= VALUE_INFINITE);
-    assert(PvNode || (alpha == beta - 1));
+    assert(alpha >= -VALUE_INFINITE && alpha < beta && beta <= VALUE_INFINITE);
+    assert(PvNode || (alpha == beta - 1));
 
-    Move      pv[MAX_PLY + 1];
-    StateInfo st;
+    Move      pv[MAX_PLY + 1];
+    StateInfo st;
 
-    Key   posKey;
-    Move  move, bestMove;
-    Value bestValue, value, futilityBase;
-    bool  pvHit, givesCheck, capture;
-    int   moveCount;
+    Key   posKey;
+    Move  move, bestMove;
+    Value bestValue, value, futilityBase;
+    bool  givesCheck, capture;
+    int   moveCount;
 
-    // Step 1. Initialize node
-    if (PvNode)
+    // Step 1. Initialize node
+    if (PvNode)
+    {
+        (ss + 1)->pv = pv;
+        ss->pv[0]    = Move::none();
+    }
+
+    Worker* thisThread = this;
+    bestMove           = Move::none();
+    ss->inCheck        = bool(pos.checkers());
+    moveCount          = 0;
+
+    // Used to send selDepth info to GUI (selDepth counts from 1, ply from 0)
+    if (PvNode && thisThread->selDepth < ss->ply + 1)
+        thisThread->selDepth = ss->ply + 1;
+
+    // Step 2. Check for repetition or maximum ply reached
+    Value result = VALUE_NONE;
+    if (pos.rule_judge(result, ss->ply))
+        return result;
+
+    // Optimized handling of rule_judge result
+    if (result != VALUE_NONE)
+    {
+        // 2 fold result is mate for us, the only chance for the opponent is to get a draw
+        // We can guarantee to get at least a draw score during searching for that line
+        if (result > VALUE_DRAW)
+            alpha = std::max(alpha, VALUE_DRAW);
+        // 2 fold result is mated for us, the only chance for us is to get a draw
+        // We can guarantee to get no more than a draw score during searching for that line
+        else // result < VALUE_DRAW
+            beta = std::min(beta, VALUE_DRAW);
+
+        if (alpha >= beta)
+            return alpha;
+    }
+
+    if (ss->ply >= MAX_PLY)
+        return !ss->inCheck ? evaluate(pos) : VALUE_DRAW;
+
+    assert(0 <= ss->ply && ss->ply < MAX_PLY);
+
+    // Step 3. Transposition table lookup
+    posKey                         = pos.key();
+    auto [ttHit, ttData, ttWriter] = tt.probe(posKey);
+    // Need further processing of the saved data
+    ss->ttHit    = ttHit;
+    ttData.move  = ttHit ? ttData.move : Move::none();
+    ttData.value = ttHit ? value_from_tt(ttData.value, ss->ply, pos.rule60_count()) : VALUE_NONE;
+    bool pvHit        = ttHit && ttData.is_pv; // Renamed to avoid shadowing
+
+    // At non-PV nodes we check for an early TT cutoff
+    if (!PvNode && ttData.depth >= DEPTH_QS
+        && is_valid(ttData.value)  // Can happen when !ttHit or when access race in probe()
+        && (ttData.bound & (ttData.value >= beta ? BOUND_LOWER : BOUND_UPPER)))
+        return ttData.value;
+
+    // Step 4. Static evaluation of the position
+    Value unadjustedStaticEval = VALUE_NONE;
+    if (ss->inCheck)
+        bestValue = futilityBase = -VALUE_INFINITE;
+    else
+    {
+        const auto correctionValue = correction_value(*thisThread, pos, ss);
+
+        if (ttHit) // Use local ttHit variable
+        {
+            // Never assume anything about values stored in TT
+            unadjustedStaticEval = ttData.eval;
+            if (!is_valid(unadjustedStaticEval))
+                unadjustedStaticEval = evaluate(pos);
+            ss->staticEval = bestValue =
+              to_corrected_static_eval(unadjustedStaticEval, correctionValue);
+
+            // ttValue can be used as a better position evaluation
+            if (is_valid(ttData.value) && !is_decisive(ttData.value)
+                && (ttData.bound & (ttData.value >= bestValue ? BOUND_LOWER : BOUND_UPPER))) // >= for symmetry with beta test
+                bestValue = ttData.value;
+        }
+        else
+        {
+            unadjustedStaticEval = evaluate(pos);
+
+            ss->staticEval = bestValue =
+              to_corrected_static_eval(unadjustedStaticEval, correctionValue);
+        }
+
+        // Stand pat. Return immediately if static value is at least beta
+        if (bestValue >= beta) [[likely]]
+        {
+            if (!is_decisive(bestValue))
+                bestValue = (bestValue + beta) / 2;
+            if (!ttHit) // Use local ttHit variable
+                ttWriter.write(posKey, value_to_tt(bestValue, ss->ply), false, BOUND_LOWER,
+                               DEPTH_UNSEARCHED, Move::none(), unadjustedStaticEval,
+                               tt.generation());
+            return bestValue;
+        }
+
+        if (bestValue > alpha)
+            alpha = bestValue;
+
+        futilityBase = ss->staticEval + 219;
+    }
+
+    // Pre-calculate common values
+    const PieceToHistory* contHist0 = (ss - 1)->continuationHistory;
+    const PieceToHistory* contHist1 = (ss - 2)->continuationHistory; // Use a dedicated pointer
+    Square prevSq = ((ss - 1)->currentMove).is_ok() ? ((ss - 1)->currentMove).to_sq() : SQ_NONE;
+
+    // Initialize a MovePicker object for the current position, and prepare to search
+    // the moves. We presently use two stages of move generator in quiescence search:
+    // captures, or evasions only when in check.
+    MovePicker mp(pos, ttData.move, DEPTH_QS, &thisThread->mainHistory, &thisThread->lowPlyHistory,
+                  &thisThread->captureHistory, {contHist0, contHist1}, &thisThread->pawnHistory, ss->ply);
+
+    // Step 5. Loop through all pseudo-legal moves until no moves remain or a beta
+    // cutoff occurs.
+    while ((move = mp.next_move()) != Move::none())
+    {
+        assert(move.is_ok());
+
+        if (!pos.legal(move)) [[unlikely]]
+            continue;
+
+        givesCheck = pos.gives_check(move);
+        capture    = pos.capture(move);
+
+        moveCount++;
+
+        // Step 6. Pruning
+        if (!is_loss(bestValue))
+        {
+            // Futility pruning and moveCount pruning
+            // Combine conditions for clarity and potential short-circuiting
+            if (!givesCheck && move.to_sq() != prevSq && !is_loss(futilityBase))
+            {
+                if (moveCount > 2) [[unlikely]]
+                    continue;
+
+                // Pre-calculate PieceValue
+                Value targetPieceValue = PieceValue[pos.piece_on(move.to_sq())];
+                Value futilityValue = futilityBase + targetPieceValue;
+
+                // If static eval + value of piece we are going to capture is
+                // much lower than alpha, we can prune this move.
+                if (futilityValue <= alpha) [[unlikely]]
+                {
+                    bestValue = std::max(bestValue, futilityValue);
+                    continue;
+                }
+
+                // If static exchange evaluation is low enough
+                // we can prune this move.
+                if (!pos.see_ge(move, alpha - futilityBase)) [[unlikely]]
+                {
+                    bestValue = std::min(alpha, futilityBase);
+                    continue;
+                }
+            }
+
+            // Continuation history based pruning
+            Piece movedPiece = pos.moved_piece(move); // Pre-calculate
+            Square toSq = move.to_sq(); // Pre-calculate
+            if (!capture &&
+                contHist0[movedPiece][toSq] +
+                thisThread->pawnHistory[pawn_structure_index(pos)][movedPiece][toSq] <= 2745) [[unlikely]]
+                continue;
+
+            // Do not search moves with bad enough SEE values
+            if (!pos.see_ge(move, -108)) [[unlikely]]
+                continue;
+        }
+
+        // Step 7. Make and search the move
+        Piece movedPiece = pos.moved_piece(move); // Already calculated
+        Square toSq = move.to_sq(); // Already calculated
+
+        do_move(pos, move, st, givesCheck);
+
+        // Update the current move
+        ss->currentMove = move;
+        ss->continuationHistory =
+          &thisThread->continuationHistory[ss->inCheck][capture][movedPiece][toSq];
+        ss->continuationCorrectionHistory =
+          &thisThread->continuationCorrectionHistory[movedPiece][toSq];
+
+        value = -qsearch<nodeType>(pos, ss + 1, -beta, -alpha);
+        undo_move(pos, move);
+
+        assert(value > -VALUE_INFINITE && value < VALUE_INFINITE);
+
+        // Step 8. Check for a new best move
+        if (value > bestValue)
+        {
+            bestValue = value;
+
+            if (value > alpha)
+            {
+                bestMove = move;
+
+                if (PvNode)  // Update pv even in fail-high case
+                    update_pv(ss->pv, move, (ss + 1)->pv);
+
+                if (value < beta)  // Update alpha here!
+                    alpha = value;
+                else
+                    break;  // Fail high
+            }
+        }
+    }
+
+    // Step 9. Check for mate
+    // All legal moves have been searched. A special case: if no legal
+    // moves were found, it is checkmate.
+    // Optimized mate check to avoid full MoveList<LEGAL> if moveCount is not zero
+    if ((bestValue == -VALUE_INFINITE && ss->inCheck) || // If in check and no moves found to escape
+        (moveCount == 0 && !ss->inCheck && !MoveList<LEGAL>(pos).size())) // If not in check, no moves, and not stalemate
+    {
+        return mated_in(ss->ply);  // Plies to mate from the root
+    }
+    // If bestValue == -VALUE_INFINITE but not in check, it implies stalemate (no legal moves, but not in check)
+    // The previous logic for !moveCount && lambda was effectively checking for stalemate.
+    // If moveCount == 0 and not inCheck, and there are no legal moves, it's stalemate.
+    // Otherwise, it's still possible to have moves, but they were all pruned.
+    if (moveCount == 0 && !ss->inCheck) // This catches cases where all moves were pruned but it's not mate/stalemate.
+                                        // This means we might have returned a bad value. Re-evaluate.
     {
-        (ss + 1)->pv = pv;
-        ss->pv[0]    = Move::none();
-    }
-
-    Worker* thisThread = this;
-    bestMove           = Move::none();
-    ss->inCheck        = bool(pos.checkers());
-    moveCount          = 0;
-
-    // Used to send selDepth info to GUI (selDepth counts from 1, ply from 0)
-    if (PvNode && thisThread->selDepth < ss->ply + 1)
-        thisThread->selDepth = ss->ply + 1;
-
-    // Step 2. Check for repetition or maximum ply reached
-    Value result = VALUE_NONE;
-    if (pos.rule_judge(result, ss->ply))
-        return result;
-    if (result != VALUE_NONE)
-    {
-        assert(result != VALUE_DRAW);
-
-        // 2 fold result is mate for us, the only chance for the opponent is to get a draw
-        // We can guarantee to get at least a draw score during searching for that line
-        if (result > VALUE_DRAW)
-            alpha = std::max(alpha, VALUE_DRAW);
-        // 2 fold result is mated for us, the only chance for us is to get a draw
-        // We can guarantee to get no more than a draw score during searching for that line
+        // This is a "no moves generated by MovePicker" case, which implies
+        // that either all captures/evasions were pruned, or there were none.
+        // In quiescent search, if no moves were found, and we are not in check,
+        // it means the static eval is the best we can do.
+        if (bestValue == -VALUE_INFINITE) // Should only happen if in check
+            return VALUE_DRAW; // Stalemate if no moves and not in check (if not already caught by rule_judge)
         else
-            beta = std::min(beta, VALUE_DRAW);
-
-        if (alpha >= beta)
-            return alpha;
+            return bestValue; // Return the best static eval / stand pat value if no good moves.
     }
 
-    if (ss->ply >= MAX_PLY)
-        return !ss->inCheck ? evaluate(pos) : VALUE_DRAW;
 
-    assert(0 <= ss->ply && ss->ply < MAX_PLY);
+    if (!is_decisive(bestValue) && bestValue > beta) [[unlikely]]
+        bestValue = (bestValue + beta) / 2;
 
-    // Step 3. Transposition table lookup
-    posKey                         = pos.key();
-    auto [ttHit, ttData, ttWriter] = tt.probe(posKey);
-    // Need further processing of the saved data
-    ss->ttHit    = ttHit;
-    ttData.move  = ttHit ? ttData.move : Move::none();
-    ttData.value = ttHit ? value_from_tt(ttData.value, ss->ply, pos.rule60_count()) : VALUE_NONE;
-    pvHit        = ttHit && ttData.is_pv;
+    // Save gathered info in transposition table. The static evaluation
+    // is saved as it was before adjustment by correction history.
+    ttWriter.write(posKey, value_to_tt(bestValue, ss->ply), pvHit,
+                   bestValue >= beta ? BOUND_LOWER : BOUND_UPPER, DEPTH_QS, bestMove,
+                   unadjustedStaticEval, tt.generation());
 
-    // At non-PV nodes we check for an early TT cutoff
-    if (!PvNode && ttData.depth >= DEPTH_QS
-        && is_valid(ttData.value)  // Can happen when !ttHit or when access race in probe()
-        && (ttData.bound & (ttData.value >= beta ? BOUND_LOWER : BOUND_UPPER)))
-        return ttData.value;
+    assert(bestValue > -VALUE_INFINITE && bestValue < VALUE_INFINITE);
 
-    // Step 4. Static evaluation of the position
-    Value unadjustedStaticEval = VALUE_NONE;
-    if (ss->inCheck)
-        bestValue = futilityBase = -VALUE_INFINITE;
-    else
-    {
-        const auto correctionValue = correction_value(*thisThread, pos, ss);
-
-        if (ss->ttHit)
-        {
-            // Never assume anything about values stored in TT
-            unadjustedStaticEval = ttData.eval;
-            if (!is_valid(unadjustedStaticEval))
-                unadjustedStaticEval = evaluate(pos);
-            ss->staticEval = bestValue =
-              to_corrected_static_eval(unadjustedStaticEval, correctionValue);
-
-            // ttValue can be used as a better position evaluation
-            if (is_valid(ttData.value) && !is_decisive(ttData.value)
-                && (ttData.bound & (ttData.value > bestValue ? BOUND_LOWER : BOUND_UPPER)))
-                bestValue = ttData.value;
-        }
-        else
-        {
-            unadjustedStaticEval = evaluate(pos);
-
-            ss->staticEval = bestValue =
-              to_corrected_static_eval(unadjustedStaticEval, correctionValue);
-        }
-
-        // Stand pat. Return immediately if static value is at least beta
-        if (bestValue >= beta)
-        {
-            if (!is_decisive(bestValue))
-                bestValue = (bestValue + beta) / 2;
-            if (!ss->ttHit)
-                ttWriter.write(posKey, value_to_tt(bestValue, ss->ply), false, BOUND_LOWER,
-                               DEPTH_UNSEARCHED, Move::none(), unadjustedStaticEval,
-                               tt.generation());
-            return bestValue;
-        }
-
-        if (bestValue > alpha)
-            alpha = bestValue;
-
-        futilityBase = ss->staticEval + 219;
-    }
-
-    const PieceToHistory* contHist[] = {(ss - 1)->continuationHistory,
-                                        (ss - 2)->continuationHistory};
-
-    Square prevSq = ((ss - 1)->currentMove).is_ok() ? ((ss - 1)->currentMove).to_sq() : SQ_NONE;
-
-    // Initialize a MovePicker object for the current position, and prepare to search
-    // the moves. We presently use two stages of move generator in quiescence search:
-    // captures, or evasions only when in check.
-    MovePicker mp(pos, ttData.move, DEPTH_QS, &thisThread->mainHistory, &thisThread->lowPlyHistory,
-                  &thisThread->captureHistory, contHist, &thisThread->pawnHistory, ss->ply);
-
-    // Step 5. Loop through all pseudo-legal moves until no moves remain or a beta
-    // cutoff occurs.
-    while ((move = mp.next_move()) != Move::none())
-    {
-        assert(move.is_ok());
-
-        if (!pos.legal(move))
-            continue;
-
-        givesCheck = pos.gives_check(move);
-        capture    = pos.capture(move);
-
-        moveCount++;
-
-        // Step 6. Pruning
-        if (!is_loss(bestValue))
-        {
-            // Futility pruning and moveCount pruning
-            if (!givesCheck && move.to_sq() != prevSq && !is_loss(futilityBase))
-            {
-                if (moveCount > 2)
-                    continue;
-
-                Value futilityValue = futilityBase + PieceValue[pos.piece_on(move.to_sq())];
-
-                // If static eval + value of piece we are going to capture is
-                // much lower than alpha, we can prune this move.
-                if (futilityValue <= alpha)
-                {
-                    bestValue = std::max(bestValue, futilityValue);
-                    continue;
-                }
-
-                // If static exchange evaluation is low enough
-                // we can prune this move.
-                if (!pos.see_ge(move, alpha - futilityBase))
-                {
-                    bestValue = std::min(alpha, futilityBase);
-                    continue;
-                }
-            }
-
-            // Continuation history based pruning
-            if (!capture
-                && (*contHist[0])[pos.moved_piece(move)][move.to_sq()]
-                       + thisThread->pawnHistory[pawn_structure_index(pos)][pos.moved_piece(move)]
-                                                [move.to_sq()]
-                     <= 2745)
-                continue;
-
-            // Do not search moves with bad enough SEE values
-            if (!pos.see_ge(move, -108))
-                continue;
-        }
-
-        // Step 7. Make and search the move
-        Piece movedPiece = pos.moved_piece(move);
-
-        do_move(pos, move, st, givesCheck);
-
-        // Update the current move
-        ss->currentMove = move;
-        ss->continuationHistory =
-          &thisThread->continuationHistory[ss->inCheck][capture][movedPiece][move.to_sq()];
-        ss->continuationCorrectionHistory =
-          &thisThread->continuationCorrectionHistory[movedPiece][move.to_sq()];
-
-        value = -qsearch<nodeType>(pos, ss + 1, -beta, -alpha);
-        undo_move(pos, move);
-
-        assert(value > -VALUE_INFINITE && value < VALUE_INFINITE);
-
-        // Step 8. Check for a new best move
-        if (value > bestValue)
-        {
-            bestValue = value;
-
-            if (value > alpha)
-            {
-                bestMove = move;
-
-                if (PvNode)  // Update pv even in fail-high case
-                    update_pv(ss->pv, move, (ss + 1)->pv);
-
-                if (value < beta)  // Update alpha here!
-                    alpha = value;
-                else
-                    break;  // Fail high
-            }
-        }
-    }
-
-    // Step 9. Check for mate
-    // All legal moves have been searched. A special case: if no legal
-    // moves were found, it is checkmate.
-    if (bestValue == -VALUE_INFINITE || (!moveCount && [&] {
-            for (const auto& m : MoveList<QUIETS>(pos))
-                if (pos.legal(m))
-                    return false;
-            return true;
-        }()))
-    {
-        assert(!MoveList<LEGAL>(pos).size());
-        return mated_in(ss->ply);  // Plies to mate from the root
-    }
-
-    if (!is_decisive(bestValue) && bestValue > beta)
-        bestValue = (bestValue + beta) / 2;
-
-    // Save gathered info in transposition table. The static evaluation
-    // is saved as it was before adjustment by correction history.
-    ttWriter.write(posKey, value_to_tt(bestValue, ss->ply), pvHit,
-                   bestValue >= beta ? BOUND_LOWER : BOUND_UPPER, DEPTH_QS, bestMove,
-                   unadjustedStaticEval, tt.generation());
-
-    assert(bestValue > -VALUE_INFINITE && bestValue < VALUE_INFINITE);
-
-    return bestValue;
+    return bestValue;
 }
 
 Depth Search::Worker::reduction(bool i, Depth d, int mn, int delta) const {
